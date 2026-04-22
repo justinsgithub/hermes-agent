@@ -709,6 +709,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        user_id: Optional[str] = None,
+        gateway_session_key: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -751,6 +753,8 @@ class APIServerAdapter(BasePlatformAdapter):
             tool_complete_callback=tool_complete_callback,
             session_db=self._ensure_session_db(),
             fallback_model=fallback_model,
+            user_id=user_id,
+            gateway_session_key=gateway_session_key,
         )
         return agent
 
@@ -1611,6 +1615,8 @@ class APIServerAdapter(BasePlatformAdapter):
         previous_response_id = body.get("previous_response_id")
         conversation = body.get("conversation")
         store = body.get("store", True)
+        user_id = body.get("user_id") if isinstance(body.get("user_id"), str) else None
+        gateway_session_key = body.get("gateway_session_key") if isinstance(body.get("gateway_session_key"), str) else None
 
         # conversation and previous_response_id are mutually exclusive
         if conversation and previous_response_id:
@@ -1744,6 +1750,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
+                user_id=user_id,
+                gateway_session_key=gateway_session_key,
                 agent_ref=agent_ref,
             ))
 
@@ -1773,6 +1781,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
+                user_id=user_id,
+                gateway_session_key=gateway_session_key,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -2168,6 +2178,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        user_id: Optional[str] = None,
+        gateway_session_key: Optional[str] = None,
         agent_ref: Optional[list] = None,
     ) -> tuple:
         """
@@ -2191,6 +2203,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
+                user_id=user_id,
+                gateway_session_key=gateway_session_key,
             )
             if agent_ref is not None:
                 agent_ref[0] = agent
