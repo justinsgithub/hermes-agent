@@ -4156,6 +4156,14 @@ class AIAgent:
         if platform_key in PLATFORM_HINTS:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
+        # Language guard: keep replies in English unless the user explicitly asks
+        # for another language. This prevents provider-specific drift (for example
+        # some GLM sessions unexpectedly replying in Chinese) without blocking
+        # intentional multilingual use.
+        prompt_parts.append(
+            "Default reply language: English. Only reply in another language when the user explicitly asks for it."
+        )
+
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
 
     # =========================================================================
