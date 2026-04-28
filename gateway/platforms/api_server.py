@@ -2586,6 +2586,108 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response({"run_id": run_id, "status": "stopping"})
 
+    # ------------------------------------------------------------------
+    # Memory introspection (read-only)
+    # ------------------------------------------------------------------
+
+    async def _handle_memory_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory/status — provider snapshot."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from gateway.platforms import api_server_memory
+        return web.json_response(api_server_memory.get_status())
+
+    async def _handle_memory_stats(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory/stats — aggregate counts (graceful)."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from gateway.platforms import api_server_memory
+        session_key = request.query.get("session_key", "").strip()
+        return web.json_response(api_server_memory.get_stats(session_key=session_key))
+
+    async def _handle_memory_profile(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory/profile?peer=user|ai — peer card + representation."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from gateway.platforms import api_server_memory
+        peer = request.query.get("peer", "user")
+        return web.json_response(api_server_memory.get_profile(peer=peer))
+
+    async def _handle_memory_context(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory/context?session_key=...&peer=... — session context."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from gateway.platforms import api_server_memory
+        session_key = request.query.get("session_key", "").strip()
+        peer = request.query.get("peer", "user")
+        return web.json_response(api_server_memory.get_context(session_key=session_key, peer=peer))
+
+    async def _handle_memory_search(self, request: "web.Request") -> "web.Response":
+        """POST /v1/memory/search — JSON body { query, peer?, max_tokens?, session_key? }."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(_openai_error("Invalid JSON in request body"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Request body must be a JSON object"), status=400)
+        query = body.get("query") or ""
+        if not isinstance(query, str) or not query.strip():
+            return web.json_response(_openai_error("'query' is required", code="missing_query"), status=400)
+        from gateway.platforms import api_server_memory
+        peer = body.get("peer", "user")
+        max_tokens_raw = body.get("max_tokens", 800)
+        try:
+            max_tokens = int(max_tokens_raw)
+        except (TypeError, ValueError):
+            max_tokens = 800
+        session_key = body.get("session_key") or ""
+        if not isinstance(session_key, str):
+            session_key = ""
+        return web.json_response(
+            api_server_memory.search_memory(
+                query=query, peer=peer, max_tokens=max_tokens, session_key=session_key,
+            )
+        )
+
+    async def _handle_memory_facts_compat(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory/facts — graceful empty body for the legacy SQLite shape."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from gateway.platforms import api_server_memory
+        return web.json_response(api_server_memory.facts_compat())
+
+    async def _handle_memory_entities_compat(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory/entities — graceful empty body."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from gateway.platforms import api_server_memory
+        return web.json_response(api_server_memory.entities_compat())
+
+    async def _handle_memory_notebook_compat(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory/notebook — graceful empty body."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from gateway.platforms import api_server_memory
+        return web.json_response(api_server_memory.notebook_compat())
+
+    async def _handle_memory_user_profile_compat(self, request: "web.Request") -> "web.Response":
+        """GET /v1/memory/user-profile — bridges to /v1/memory/profile?peer=user."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from gateway.platforms import api_server_memory
+        return web.json_response(api_server_memory.user_profile_compat())
+
     async def _sweep_orphaned_runs(self) -> None:
         """Periodically clean up run streams that were never consumed."""
         while True:
@@ -2638,6 +2740,17 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}/events", self._handle_run_events)
             self._app.router.add_post("/v1/runs/{run_id}/stop", self._handle_stop_run)
+            # Memory introspection (read-only) — admin/operator surface
+            self._app.router.add_get("/v1/memory/status", self._handle_memory_status)
+            self._app.router.add_get("/v1/memory/stats", self._handle_memory_stats)
+            self._app.router.add_get("/v1/memory/profile", self._handle_memory_profile)
+            self._app.router.add_get("/v1/memory/context", self._handle_memory_context)
+            self._app.router.add_post("/v1/memory/search", self._handle_memory_search)
+            # Compatibility wrappers for the legacy SQLite-shaped memory routes
+            self._app.router.add_get("/v1/memory/facts", self._handle_memory_facts_compat)
+            self._app.router.add_get("/v1/memory/entities", self._handle_memory_entities_compat)
+            self._app.router.add_get("/v1/memory/notebook", self._handle_memory_notebook_compat)
+            self._app.router.add_get("/v1/memory/user-profile", self._handle_memory_user_profile_compat)
             # Start background sweep to clean up orphaned (unconsumed) run streams
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
