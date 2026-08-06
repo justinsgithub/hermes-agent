@@ -621,6 +621,24 @@ class TestDisconnectedAgentReap:
         assert calls == [("run-stop-sess", frozenset(), "api_server_run_stop")]
         agent.interrupt.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_run_agent_forwards_memory_bypass_to_agent_constructor(self, adapter):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent) as create:
+            await adapter._run_agent(
+                user_message="Reply: OK",
+                conversation_history=[],
+                session_id="health-probe",
+                skip_memory=True,
+            )
+
+        assert create.call_args.kwargs["skip_memory"] is True
+
 
 class TestRunEventCallback:
 
@@ -1349,6 +1367,73 @@ class TestResponsesEndpoint:
             assert data["output"][0]["type"] == "message"
             assert data["output"][0]["content"][0]["type"] == "output_text"
             assert data["output"][0]["content"][0]["text"] == "Paris is the capital of France."
+
+    @pytest.mark.asyncio
+    async def test_memory_bypass_header_threads_to_agent(self, auth_adapter):
+        """Authenticated synthetic probes can bypass recall/retention only."""
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Memory": "bypass",
+                    },
+                    json={"model": "hermes-agent", "input": "Reply: OK"},
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["skip_memory"] is True
+
+    @pytest.mark.asyncio
+    async def test_memory_defaults_enabled(self, auth_adapter):
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+                resp = await cli.post(
+                    "/v1/responses",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"model": "hermes-agent", "input": "Reply: OK"},
+                )
+
+        assert resp.status == 200
+        assert mock_run.call_args.kwargs["skip_memory"] is False
+
+    @pytest.mark.asyncio
+    async def test_memory_header_rejects_ambiguous_value(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                headers={
+                    "Authorization": "Bearer sk-secret",
+                    "X-Hermes-Memory": "off-ish",
+                },
+                json={"model": "hermes-agent", "input": "Reply: OK"},
+            )
+        assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_memory_bypass_still_requires_authentication(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/responses",
+                headers={"X-Hermes-Memory": "bypass"},
+                json={"model": "hermes-agent", "input": "Reply: OK"},
+            )
+        assert resp.status == 401
 
 
     @pytest.mark.asyncio

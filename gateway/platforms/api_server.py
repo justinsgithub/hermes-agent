@@ -2826,6 +2826,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        skip_memory: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -3136,6 +3137,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "skip_memory": skip_memory,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
@@ -3366,6 +3368,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
+                "memory_control_header": "X-Hermes-Memory",
                 "cors": bool(self._cors_origins),
                 # Browser-extension control is always advertised so clients
                 # can feature-detect it, but remains disabled until
@@ -6203,6 +6206,22 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
+        # Synthetic callers such as generation-level liveness probes can opt
+        # out of long-term recall/retention without weakening the actual model
+        # exercise. Reject unknown values so a typo cannot silently change the
+        # request's memory semantics. Authentication has already been enforced
+        # by @_admit_api_agent_request before this handler runs.
+        memory_mode = request.headers.get("X-Hermes-Memory", "").strip().lower()
+        if memory_mode not in ("", "enabled", "bypass"):
+            return web.json_response(
+                _openai_error(
+                    "X-Hermes-Memory must be 'enabled' or 'bypass'",
+                    err_type="invalid_request_error",
+                ),
+                status=400,
+            )
+        skip_memory = memory_mode == "bypass"
+
         # Bound total in-flight agent runs (configurable; #7483).
         limited = self._concurrency_limited_response()
         if limited is not None:
@@ -6381,6 +6400,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                skip_memory=skip_memory,
                 **agent_overrides,
                 route=route,
             ))
@@ -6416,6 +6436,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                skip_memory=skip_memory,
                 **agent_overrides,
                 route=route,
             )
@@ -7240,6 +7261,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        skip_memory: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -7311,6 +7333,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        skip_memory=skip_memory,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
