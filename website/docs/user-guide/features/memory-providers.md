@@ -416,7 +416,7 @@ The plugin authenticates with `X-API-Key` and uses the server's `/search` / `/me
 
 ### Hindsight
 
-Long-term memory with knowledge graph, entity resolution, and multi-strategy retrieval. The `hindsight_reflect` tool provides cross-memory synthesis that no other provider offers. Automatically retains full conversation turns (including tool calls) with session-level document tracking.
+Long-term memory with knowledge graph, entity resolution, and multi-strategy retrieval. The `hindsight_reflect` tool provides cross-memory synthesis that no other provider offers. Automatic retention stores the original user message and final assistant response only; tool calls and tool outputs are excluded.
 
 | | |
 |---|---|
@@ -435,7 +435,7 @@ hermes config set memory.provider hindsight
 echo "HINDSIGHT_API_KEY=your-key" >> ~/.hermes/.env
 ```
 
-The setup wizard installs dependencies automatically and only installs what's needed for the selected mode (`hindsight-client` for cloud, `hindsight-all` for local). Requires `hindsight-client >= 0.4.22` (auto-upgraded on session start if outdated).
+The setup wizard installs dependencies automatically and only installs what's needed for the selected mode (`hindsight-client` for cloud, `hindsight-all` for local). The integration pins `hindsight-client 0.8.6` and uses `tiktoken` for final recall-budget enforcement.
 
 **Local mode UI:** `hindsight-embed -p hermes ui start`
 
@@ -449,13 +449,20 @@ The setup wizard installs dependencies automatically and only installs what's ne
 | `memory_mode` | `hybrid` | `hybrid` (context + tools), `context` (auto-inject only), `tools` (tools only) |
 | `auto_retain` | `true` | Automatically retain conversation turns |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
-| `retain_async` | `true` | Process retain asynchronously on the server |
+| `retain_async` | `true` | Compatibility setting; durable automatic retention always uses the idempotent async server path |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
 | `retain_source` | — | Optional `metadata.source` attached to retained memories |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
-| `recall_tags` | — | Tags to filter on recall |
+| `observation_scopes` | `shared` | Literal global observation scope for conversational memory |
+| `integration_profile` | active profile | Stable profile provenance tag |
+| `integration_scope` | derived | Personal/business isolation provenance tag |
+
+Automatic recall runs exact-global observations and raw world/experience facts
+concurrently, removes source-covered duplicates, and enforces one final token
+budget. The per-profile durable outbox persists bounded retain parts and operation
+UUIDs before send, so a crash or lost acknowledgement replays the exact request.
 
 See [plugin README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/memory/hindsight/README.md) for the full configuration reference.
 

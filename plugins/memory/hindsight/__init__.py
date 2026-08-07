@@ -19,8 +19,8 @@ Config via environment variables:
   HINDSIGHT_IDLE_TIMEOUT           — embedded daemon idle timeout seconds; 0 disables shutdown (default: 300)
   HINDSIGHT_EMBED_PORT_HEALTH_GRACE_TIMEOUT — seconds to wait for a slow embedded daemon /health before treating it as stale (default: 30; set via config.json port_health_grace_timeout)
   HINDSIGHT_RETAIN_TAGS            — comma-separated tags attached to retained memories
-  HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
-  HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories (default: hermes)
+  HINDSIGHT_RETAIN_OBSERVATION_SCOPES — observation scoping for retained memories: shared/per_tag/combined/all_combinations, or a JSON list of tag-lists for custom scopes
+  HINDSIGHT_RETAIN_SOURCE          — metadata source value attached to retained memories
   HINDSIGHT_RETAIN_USER_PREFIX     — label used before user turns in retained transcripts
   HINDSIGHT_RETAIN_ASSISTANT_PREFIX — label used before assistant turns in retained transcripts
 
@@ -40,18 +40,36 @@ import queue
 import sys
 import threading
 import time
-
 from dataclasses import dataclass
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.secret_scope import get_secret
 
 from agent.memory_provider import MemoryProvider, RecallStatus
-from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
-from tools.registry import tool_error
 from hermes_cli.config import cfg_get
+from hermes_constants import get_hermes_home
+from plugins.memory.hindsight.contract import (
+    AUTOMATIC_RECALL_MODE,
+    FULL_PROVENANCE_MODE,
+    LEGACY_OBSERVATIONS_MODE,
+    MAX_CONTENT_CHARACTERS_PER_PART,
+    MAX_GATEWAY_BODY_BYTES,
+    RECALL_MODES,
+    RecallBundle,
+    bundle_single_response,
+    bundle_two_lane,
+    immutable_json_sha256,
+    render_recall_bundle,
+    resolve_profile_scope,
+    sealed_conversation_tags,
+    split_text_utf8_safe,
+)
+from plugins.memory.hindsight.contract import SERVER_MIXED_MODE as SERVER_MIXED_MODE
+from plugins.memory.hindsight.outbox import DurableRetainOutbox
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +90,8 @@ class _RecallResult:
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+_MIN_CLIENT_VERSION = "0.8.6"
+_CLIENT_SPEC = "hindsight-client==0.8.6"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -86,8 +105,8 @@ _HINDSIGHT_GLYPH = "👁️"
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
-# overwrites prior turns server-side, so we keep the per-process
-# unique document_id fallback for older APIs.
+# overwrites prior turns server-side, so older APIs receive one immutable
+# document per retained part.
 _MIN_VERSION_FOR_UPDATE_MODE_APPEND = "0.5.0"
 _VALID_BUDGETS = {"low", "mid", "high"}
 _PROVIDER_DEFAULT_MODELS = {
@@ -242,7 +261,6 @@ def _fetch_hindsight_api_version(api_url: str, api_key: str | None = None,
     Any failure (timeout, 404, malformed JSON, missing key) → None, which
     the caller treats as "legacy API, no update_mode support".
     """
-    import urllib.error
     import urllib.request
     if not api_url:
         return None
@@ -268,7 +286,7 @@ def _check_api_supports_update_mode_append(api_url: str,
     """Cached capability check for ``update_mode='append'`` on *api_url*.
 
     Probes once per URL per process. Returns False on any probe failure —
-    that's the safe default: a per-process unique ``document_id`` and no
+    that's the safe default: an immutable document per part and no
     ``update_mode`` keeps the resume-overwrite fix (#6654) intact.
     """
     if not api_url:
@@ -288,8 +306,8 @@ def _check_api_supports_update_mode_append(api_url: str,
     if not supported:
         logger.warning(
             "Hindsight API at %s reports version %r, older than %s. "
-            "Falling back to per-process document_id — retains across "
-            "processes/sessions create separate documents instead of "
+            "Falling back to immutable per-part document IDs — retains "
+            "create separate documents instead of "
             "appending to a session-scoped one. Upgrade Hindsight to "
             "%s+ to enable update_mode='append' deduplication.",
             api_url, version, _MIN_VERSION_FOR_UPDATE_MODE_APPEND,
@@ -392,6 +410,22 @@ RECALL_SCHEMA = {
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "What to search for."},
+            "mode": {
+                "type": "string",
+                "enum": sorted(RECALL_MODES),
+                "default": AUTOMATIC_RECALL_MODE,
+                "description": (
+                    "automatic uses concurrent shared-observation and raw-fact lanes; "
+                    "legacy_observations searches all observation scopes; full_provenance "
+                    "adds source bodies under an explicit sub-budget; server_mixed uses "
+                    "Hindsight's prefer_observations mode."
+                ),
+            },
+            "source_facts_max_tokens": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Required only for full_provenance; bounded by recall_max_tokens.",
+            },
         },
         "required": ["query"],
     },
@@ -449,7 +483,7 @@ def _load_config() -> dict:
         "timeout": _parse_int_setting(os.environ.get("HINDSIGHT_TIMEOUT"), _DEFAULT_TIMEOUT),
         "idle_timeout": _parse_int_setting(os.environ.get("HINDSIGHT_IDLE_TIMEOUT"), _DEFAULT_IDLE_TIMEOUT),
         "retain_tags": os.environ.get("HINDSIGHT_RETAIN_TAGS", ""),
-        "observation_scopes": os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", ""),
+        "observation_scopes": os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "shared"),
         "retain_source": os.environ.get("HINDSIGHT_RETAIN_SOURCE", _DEFAULT_RETAIN_SOURCE),
         "retain_user_prefix": os.environ.get("HINDSIGHT_RETAIN_USER_PREFIX", "User"),
         "retain_assistant_prefix": os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant"),
@@ -500,7 +534,7 @@ def _normalize_retain_tags(value: Any) -> List[str]:
     return normalized
 
 
-_OBSERVATION_SCOPE_KEYWORDS = {"per_tag", "combined", "all_combinations"}
+_OBSERVATION_SCOPE_KEYWORDS = {"shared", "per_tag", "combined", "all_combinations"}
 
 
 def _normalize_observation_scopes(value: Any) -> Any:
@@ -508,12 +542,14 @@ def _normalize_observation_scopes(value: Any) -> Any:
 
     Returns one of:
       * ``None`` — nothing configured; Hindsight applies its ``combined`` default.
-      * a keyword string — ``"per_tag"`` / ``"combined"`` / ``"all_combinations"``.
+      * a keyword string — ``"shared"`` / ``"per_tag"`` / ``"combined"`` /
+        ``"all_combinations"``.
       * ``list[list[str]]`` — custom scopes, one inner list per consolidation pass.
 
     Accepts a keyword string, a JSON-encoded list, a flat list of tags (treated as
     a single scope), or a list of tag-lists. Anything unrecognized yields ``None``
-    so we never send an invalid payload.
+    so we never send an invalid payload. A list containing ``shared`` fails
+    explicitly because Hindsight's global scope is only the literal string.
     """
     if value is None:
         return None
@@ -533,6 +569,15 @@ def _normalize_observation_scopes(value: Any) -> Any:
         return None
 
     if isinstance(value, (list, tuple)):
+        # Hindsight's global scope is the literal string ``"shared"``.  A
+        # list-shaped lookalike silently means a custom tag scope and would
+        # reintroduce the session fragmentation this integration prevents.
+        if any(
+            str(tag).strip() == "shared"
+            for entry in value
+            for tag in (entry if isinstance(entry, (list, tuple)) else [entry])
+        ):
+            raise ValueError("observation_scopes shared must be the literal string 'shared'")
         # A flat list of tag strings is one scope; a list of lists is many.
         if all(isinstance(entry, str) for entry in value):
             inner = [entry.strip() for entry in value if entry.strip()]
@@ -774,6 +819,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_source = _DEFAULT_RETAIN_SOURCE
         self._retain_user_prefix = "User"
         self._retain_assistant_prefix = "Assistant"
+        self._integration_profile = "default"
+        self._integration_scope = "personal"
         self._platform = ""
         self._user_id = ""
         self._user_name = ""
@@ -828,6 +875,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # deliberately coarser than the 0.05s local queue-drain poll: ~20 calls
         # max over the default 10s budget instead of ~200.
         self._RETAIN_OP_POLL_INTERVAL_S = 0.5
+        self._outbox: DurableRetainOutbox | None = None
+        self._outbox_poison_attempts = 5
         # Legacy alias — older tests/callers reference _sync_thread directly.
         # Points at _writer_thread once the writer is running.
         self._sync_thread = None
@@ -867,14 +916,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = True
         self._recall_sync = False
         self._recall_max_tokens = 4096
-        # Default to observation-only recall. Observations are Hindsight's
-        # consolidated knowledge layer — deduplicated, evidence-grounded
-        # beliefs built from many raw facts, with proof counts and
-        # freshness signals (see hindsight.vectorize.io/developer/observations).
-        # Including raw world/experience facts re-ships the supporting
-        # evidence that observations already summarize, burning the
-        # `recall_max_tokens` budget. Users can restore the broader
-        # recall via the `recall_types` config key.
+        # Retained only for backward-compatible config readback. Automatic
+        # recall uses the sealed concurrent observation/raw lanes below.
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
@@ -946,15 +989,17 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def post_setup(self, hermes_home: str, config: dict) -> None:
         """Custom setup wizard — installs only the deps needed for the selected mode."""
-        import subprocess
         import shutil
-        import sys
+        import subprocess
         from pathlib import Path
 
         from hermes_cli.config import save_config
+        from hermes_cli.memory_setup import (
+            _CANCELLED,
+            _curses_select,
+            _print_cancelled_setup,
+        )
         from hermes_cli.secret_prompt import masked_secret_prompt
-
-        from hermes_cli.memory_setup import _CANCELLED, _curses_select, _print_cancelled_setup
 
         print("\n  Configuring Hindsight memory:\n")
 
@@ -982,14 +1027,15 @@ class HindsightMemoryProvider(MemoryProvider):
         env_writes: dict = {}
 
         # Step 2: Install/upgrade deps for selected mode
-        cloud_dep = f"hindsight-client>={_MIN_CLIENT_VERSION}"
-        local_dep = "hindsight-all"
+        cloud_dep = _CLIENT_SPEC
+        tokenizer_dep = "tiktoken>=0.9,<1"
+        local_dep = "hindsight-all==0.8.6"
         if mode == "local_embedded":
-            deps_to_install = [local_dep]
+            deps_to_install = [local_dep, tokenizer_dep]
         elif mode == "local_external":
-            deps_to_install = [cloud_dep]
+            deps_to_install = [cloud_dep, tokenizer_dep]
         else:
-            deps_to_install = [cloud_dep]
+            deps_to_install = [cloud_dep, tokenizer_dep]
 
         llm_provider = ""
         if mode == "local_embedded":
@@ -1205,13 +1251,15 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
-            {"key": "observation_scopes", "description": "How observations are scoped during consolidation: 'combined' (default — one pass over all tags), 'per_tag' (one isolated observation per tag), 'all_combinations' (every tag subset — expensive), or a JSON list of tag-lists for explicit custom scopes. Empty uses Hindsight's 'combined' default.", "default": ""},
-            {"key": "retain_source", "description": "Metadata source value attached to retained memories (identifies the client that stored them)", "default": _DEFAULT_RETAIN_SOURCE},
+            {"key": "observation_scopes", "description": "How observations are scoped during consolidation. Conversational memory requires the literal string 'shared'; list-shaped ['shared'] is invalid. Advanced non-conversational uses may select per_tag, combined, all_combinations, or explicit tag lists.", "default": "shared"},
+            {"key": "integration_profile", "description": "Stable Hermes profile label used in conversational provenance tags (defaults to the active profile)", "default": ""},
+            {"key": "integration_scope", "description": "Isolation scope used in conversational provenance tags (derived from the deployed bank when blank)", "default": "", "choices": ["", "personal", "business"]},
+            {"key": "retain_source", "description": "Metadata source value attached to retained memories", "default": _DEFAULT_RETAIN_SOURCE},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},
-            {"key": "recall_tags", "description": "Tags to filter when searching memories (comma-separated)", "default": ""},
-            {"key": "recall_tags_match", "description": "Tag matching mode for recall", "default": "any", "choices": ["any", "all", "any_strict", "all_strict"]},
-            {"key": "recall_types", "description": "Fact types to surface on recall — applies to both auto-recall and the hindsight_recall tool (comma-separated or list). Defaults to observation-only — observations are Hindsight's consolidated, deduplicated, evidence-grounded knowledge layer; raw world/experience facts are the supporting evidence observations already summarize. Set to e.g. 'observation,world,experience' to also include raw facts.", "default": "observation"},
+            {"key": "recall_tags", "description": "Legacy compatibility setting; automatic two-lane recall uses exact global observations plus unfiltered raw facts", "default": ""},
+            {"key": "recall_tags_match", "description": "Legacy compatibility tag mode; automatic recall uses exact for its empty observation tag set", "default": "any", "choices": ["any", "all", "any_strict", "all_strict", "exact"]},
+            {"key": "recall_types", "description": "Legacy compatibility setting. Automatic recall always uses observation and world/experience lanes; manual modes are selected per hindsight_recall call.", "default": "observation"},
             {"key": "auto_recall", "description": "Automatically recall memories before each turn", "default": True},
             {"key": "recall_sync", "description": "Recall synchronously against the current message before each turn (higher relevance, adds recall latency to the turn). Default off: recall runs in the background and is injected on the next turn.", "default": False},
             {"key": "recall_indicator", "description": "Show a '👁️ Hindsight — recalled N memories' status line when auto-recall injects memory (turn off for customer-facing agents)", "default": True},
@@ -1221,6 +1269,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "prefetch_waits_for_retain", "description": "Have the background next-turn prefetch wait for the just-completed retain to become recall-visible on the server (local queue drain + async operation completion) before recalling, so recall includes the just-completed turn (runs off the reply path, adds no response latency)", "default": True},
             {"key": "prefetch_retain_drain_timeout", "description": "Max seconds the background prefetch waits for the retain to become recall-visible (queue drain + server-side completion) before recalling anyway", "default": 10.0},
+            {"key": "outbox_poison_attempts", "description": "Failed delivery attempts before an item remains durably quarantined while later turns drain", "default": 5},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
@@ -1489,10 +1538,11 @@ class HindsightMemoryProvider(MemoryProvider):
             time.sleep(self._RETAIN_OP_POLL_INTERVAL_S)
 
     def _writer_loop(self) -> None:
-        """Drain the retain queue serially. Exits on sentinel.
+        """Drain durable operation references serially. Exits on sentinel.
 
-        Each job() is wrapped so a single failure can't kill the writer.
-        task_done() always fires so queue.join() works in tests.
+        The queue is only a wake-up mechanism; the filesystem record is the
+        authority.  A failed operation is moved to the tail with the exact same
+        UUID/request, so a poison item cannot block later turns.
         """
         while True:
             try:
@@ -1505,11 +1555,48 @@ class HindsightMemoryProvider(MemoryProvider):
                 if job is _WRITER_SENTINEL:
                     return
                 try:
-                    job()
+                    self._dispatch_outbox_job(job)
                 except Exception as exc:
-                    logger.warning("Hindsight retain failed: %s", exc, exc_info=True)
+                    logger.warning(
+                        "Hindsight durable retain dispatch failed: %s",
+                        type(exc).__name__,
+                        exc_info=True,
+                    )
             finally:
                 self._retain_queue.task_done()
+
+    def _dispatch_outbox_job(self, job: Any) -> None:
+        if self._outbox is None or not isinstance(job, tuple) or len(job) != 2:
+            return
+        turn_id, part_index = str(job[0]), int(job[1])
+        request = self._outbox.request_for(turn_id, part_index)
+        if request is None:
+            return
+        try:
+            response = self._run_hindsight_operation(
+                lambda client: client.aretain_batch(**request)
+            )
+        except Exception as exc:
+            should_retry = self._outbox.mark_failure(turn_id, part_index, exc)
+            logger.warning(
+                "Hindsight retain attempt failed (turn=%s part=%d error_type=%s retry=%s)",
+                turn_id,
+                part_index,
+                type(exc).__name__,
+                should_retry,
+            )
+            if should_retry and not self._shutting_down.is_set():
+                # Small bounded delay prevents a hot retry loop.  The durable
+                # record, not this in-memory requeue, guarantees restart replay.
+                time.sleep(0.05)
+                self._retain_queue.put((turn_id, part_index))
+            return
+        self._track_retain_ops(response, str(request.get("bank_id") or self._bank_id))
+        self._outbox.mark_acknowledged(turn_id, part_index)
+        self._last_retained_turn_count = self._outbox.contiguous_acked_turn(
+            self._bank_id,
+            self._session_id,
+        )
 
     def _register_atexit(self) -> None:
         """Register an idempotent atexit hook to drain the writer.
@@ -1566,12 +1653,10 @@ class HindsightMemoryProvider(MemoryProvider):
         """Pick (document_id, update_mode) based on live API capability.
 
         On Hindsight ≥ 0.5.0 the API supports ``update_mode='append'``,
-        which lets us reuse a stable session-scoped ``document_id`` across
-        process lifecycles without overwriting prior turns. On older APIs
-        we fall back to *fallback_document_id* (the per-process unique
-        ``f"{session_id}-{start_ts}"`` minted at initialize / switch time)
-        and don't pass ``update_mode`` at all — that's the only way the
-        resume-overwrite fix (#6654) keeps working on legacy servers.
+        which lets us reuse a stable session-scoped UUID across process
+        lifecycles without overwriting prior turns. On older APIs this helper
+        leaves append disabled; ``sync_turn`` then replaces the target with an
+        immutable per-part UUID so no later turn can overwrite it.
 
         Probe is cached at module level per API URL, so this is one HTTP
         round-trip per (process, api_url) pair regardless of how many
@@ -1580,7 +1665,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if not self._session_id:
             return fallback_document_id, None
         if _check_api_supports_update_mode_append(self._probe_url(), self._api_key):
-            return self._session_id, "append"
+            return fallback_document_id, "append"
         return fallback_document_id, None
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -1592,34 +1677,31 @@ class HindsightMemoryProvider(MemoryProvider):
         if callable(_status_cb):
             self._status_callback = _status_cb
 
-        # Each process lifecycle gets its own document_id. Reusing session_id
-        # alone caused overwrites on /resume — the reloaded session starts
-        # with an empty _session_turns, so the next retain would replace the
-        # previously stored content. session_id stays in tags so processes
-        # for the same session remain filterable together.
-        start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self._document_id = f"{self._session_id}-{start_ts}"
+        # The exact stable document UUID is resolved after profile/bank config
+        # loads. Legacy replace-only APIs use immutable per-part IDs instead.
+        self._document_id = ""
 
         # Check client version and auto-upgrade if needed
         try:
             from importlib.metadata import version as pkg_version
+
             from packaging.version import Version
             installed = pkg_version("hindsight-client")
-            if Version(installed) < Version(_MIN_CLIENT_VERSION):
-                logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
+            if Version(installed) != Version(_MIN_CLIENT_VERSION):
+                logger.warning("hindsight-client %s does not match required %s; reconciling...",
                                installed, _MIN_CLIENT_VERSION)
                 # Environment-aware install: sealed hosted venvs redirect to the
                 # durable data-volume target instead of /opt/hermes (NS-605).
                 from tools.lazy_deps import install_specs
-                outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
+                outcome = install_specs([_CLIENT_SPEC], timeout=120)
                 if outcome.ok:
-                    logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
+                    logger.info("hindsight-client reconciled to %s", _MIN_CLIENT_VERSION)
                 elif outcome.blocked:
-                    logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                   outcome.reason, _MIN_CLIENT_VERSION)
+                    logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install '%s'",
+                                   outcome.reason, _CLIENT_SPEC)
                 else:
-                    logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                   (outcome.stderr or "").strip() or "install error", _MIN_CLIENT_VERSION)
+                    logger.warning("Auto-upgrade failed: %s. Run: uv pip install '%s'",
+                                   (outcome.stderr or "").strip() or "install error", _CLIENT_SPEC)
         except Exception:
             pass  # packaging not available or other issue — proceed anyway
 
@@ -1634,6 +1716,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._agent_identity = str(kwargs.get("agent_identity") or "").strip()
         self._agent_workspace = str(kwargs.get("agent_workspace") or "").strip()
         self._turn_index = 0
+        self._turn_counter = 0
         self._session_turns = []
         self._last_retained_turn_count = 0
         self._mode = self._config.get("mode", "cloud")
@@ -1698,10 +1781,12 @@ class HindsightMemoryProvider(MemoryProvider):
             or os.environ.get("HINDSIGHT_RETAIN_TAGS", "")
         )
         self._tags = self._retain_tags or None
-        self._observation_scopes = _normalize_observation_scopes(
+        configured_observation_scopes = (
             self._config.get("observation_scopes")
-            or os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "")
+            if "observation_scopes" in self._config
+            else os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "shared")
         )
+        self._observation_scopes = _normalize_observation_scopes(configured_observation_scopes) or "shared"
         self._recall_tags = self._config.get("recall_tags") or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
         self._retain_source = str(
@@ -1713,6 +1798,21 @@ class HindsightMemoryProvider(MemoryProvider):
         self._retain_assistant_prefix = str(
             self._config.get("retain_assistant_prefix") or os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant")
         ).strip() or "Assistant"
+        self._integration_profile = str(
+            self._config.get("integration_profile") or self._agent_identity or "default"
+        ).strip() or "default"
+        self._integration_scope = resolve_profile_scope(
+            self._integration_profile,
+            self._bank_id,
+            str(self._config.get("integration_scope") or ""),
+        )
+        document_uuid = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"hermes-hindsight:{self._integration_profile}:{self._bank_id}:{self._session_id}",
+            )
+        )
+        self._document_id = f"{self._session_id}-{document_uuid}"
 
         # Retain controls
         self._auto_retain = self._config.get("auto_retain", True)
@@ -1723,6 +1823,8 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = self._config.get("auto_recall", True)
         self._recall_sync = bool(self._config.get("recall_sync", False))
         self._recall_max_tokens = int(self._config.get("recall_max_tokens", 4096))
+        if self._recall_max_tokens < 2:
+            raise ValueError("Hindsight recall_max_tokens must be at least 2")
         # Default narrows recall to observation-only; pass an explicit
         # `recall_types` list in config.json to broaden (e.g. include
         # "world" / "experience") or to disable the filter entirely.
@@ -1749,6 +1851,24 @@ class HindsightMemoryProvider(MemoryProvider):
         self._prefetch_retain_drain_timeout = float(
             self._config.get("prefetch_retain_drain_timeout", 10.0)
         )
+        self._outbox_poison_attempts = max(1, int(self._config.get("outbox_poison_attempts", 5)))
+        self._outbox = DurableRetainOutbox(
+            get_hermes_home(),
+            poison_attempts=self._outbox_poison_attempts,
+        )
+        self._outbox.recover_acknowledged_turns()
+        self._outbox.promote_abandoned_sessions(self._bank_id, self._session_id)
+        self._turn_counter = self._outbox.max_known_turn(self._bank_id, self._session_id)
+        self._turn_index = self._turn_counter
+        self._last_retained_turn_count = self._outbox.contiguous_acked_turn(
+            self._bank_id,
+            self._session_id,
+        )
+        if self._outbox.pending_jobs():
+            self._ensure_writer()
+            self._register_atexit()
+            for job in self._outbox.pending_jobs():
+                self._retain_queue.put(job)
 
         _client_version = "unknown"
         try:
@@ -1873,42 +1993,147 @@ class HindsightMemoryProvider(MemoryProvider):
             return True
         return False
 
-    def _do_recall(self, query: str) -> _RecallResult:
-        """Run one recall/reflect for *query*.
+    def _recall_lane_budgets(self) -> tuple[int, int]:
+        """Reserve formatter headroom while giving observations priority."""
 
-        Returns the formatted memory text plus the number of discrete memories
-        recalled (0 for a reflect synthesis or on error), so the deterministic
-        recall indicator can report an accurate count without re-parsing the
-        text. Shared by the background prefetch worker (``queue_prefetch``) and
-        the opt-in synchronous path (``prefetch`` when ``recall_sync`` is on).
-        """
-        # Truncate query to max chars
+        total = int(self._recall_max_tokens)
+        if total < 2:
+            raise ValueError("recall_max_tokens must be at least 2")
+        observation_tokens = max(1, int(total * 0.55))
+        raw_tokens = max(1, int(total * 0.35))
+        if observation_tokens + raw_tokens > total:
+            raw_tokens = max(1, total - observation_tokens)
+        return observation_tokens, raw_tokens
+
+    async def _two_lane_recall_async(
+        self,
+        client: Any,
+        query: str,
+        *,
+        source_facts_max_tokens: int = 1,
+    ) -> RecallBundle:
+        observation_tokens, raw_tokens = self._recall_lane_budgets()
+        observation_call = client.arecall(
+            bank_id=self._bank_id,
+            query=query,
+            budget=self._budget,
+            max_tokens=observation_tokens,
+            types=["observation"],
+            tags=[],
+            tags_match="exact",
+            include_entities=False,
+            include_source_facts=True,
+            max_source_facts_tokens=source_facts_max_tokens,
+        )
+        raw_call = client.arecall(
+            bank_id=self._bank_id,
+            query=query,
+            budget=self._budget,
+            max_tokens=raw_tokens,
+            types=["world", "experience"],
+            include_entities=False,
+        )
+        observation_response, raw_response = await asyncio.gather(
+            observation_call,
+            raw_call,
+        )
+        return bundle_two_lane(observation_response, raw_response)
+
+    def _recall_bundle(
+        self,
+        query: str,
+        *,
+        mode: str = AUTOMATIC_RECALL_MODE,
+        source_facts_max_tokens: int | None = None,
+    ) -> RecallBundle:
+        if mode not in RECALL_MODES:
+            raise ValueError(f"Unknown Hindsight recall mode: {mode}")
+
+        if mode in {AUTOMATIC_RECALL_MODE, FULL_PROVENANCE_MODE}:
+            source_budget = 1
+            if mode == FULL_PROVENANCE_MODE:
+                if source_facts_max_tokens is None:
+                    raise ValueError("full_provenance requires source_facts_max_tokens")
+                source_budget = int(source_facts_max_tokens)
+                if source_budget < 1 or source_budget > self._recall_max_tokens:
+                    raise ValueError(
+                        "source_facts_max_tokens must be between 1 and recall_max_tokens"
+                    )
+            return self._run_hindsight_operation(
+                lambda client: self._two_lane_recall_async(
+                    client,
+                    query,
+                    source_facts_max_tokens=source_budget,
+                )
+            )
+
+        if mode == LEGACY_OBSERVATIONS_MODE:
+            response = self._run_hindsight_operation(
+                lambda client: client.arecall(
+                    bank_id=self._bank_id,
+                    query=query,
+                    budget=self._budget,
+                    max_tokens=self._recall_max_tokens,
+                    types=["observation"],
+                    include_entities=False,
+                )
+            )
+            return bundle_single_response(response)
+
+        response = self._run_hindsight_operation(
+            lambda client: client.arecall(
+                bank_id=self._bank_id,
+                query=query,
+                budget=self._budget,
+                max_tokens=self._recall_max_tokens,
+                types=["world", "experience", "observation"],
+                include_entities=False,
+                prefer_observations=True,
+            )
+        )
+        return bundle_single_response(response)
+
+    def _render_recall(
+        self,
+        bundle: RecallBundle,
+        *,
+        include_source_content: bool = False,
+    ) -> str:
+        return render_recall_bundle(
+            bundle,
+            max_tokens=self._recall_max_tokens,
+            include_source_content=include_source_content,
+        )
+
+    def _do_recall(self, query: str) -> _RecallResult:
+        """Run one recall/reflect and preserve an exact indicator count."""
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
         try:
             if self._prefetch_method == "reflect":
-                logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                # Reflect synthesizes across many memories -> no discrete count.
-                return _RecallResult(resp.text or "", 0)
-            recall_kwargs: dict = {
-                "bank_id": self._bank_id, "query": query,
-                "budget": self._budget, "max_tokens": self._recall_max_tokens,
-            }
-            if self._recall_tags:
-                recall_kwargs["tags"] = self._recall_tags
-                recall_kwargs["tags_match"] = self._recall_tags_match
-            if self._recall_types:
-                recall_kwargs["types"] = self._recall_types
-            logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
-                         self._bank_id, len(query), self._budget)
-            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-            num_results = len(resp.results) if resp.results else 0
-            logger.debug("Recall: returned %d results", num_results)
-            text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
-            return _RecallResult(text, num_results)
-        except Exception as e:
-            logger.debug("Hindsight recall failed: %s", e, exc_info=True)
+                logger.debug(
+                    "Recall: calling reflect (bank=%s, query_len=%d)",
+                    self._bank_id,
+                    len(query),
+                )
+                response = self._run_hindsight_operation(
+                    lambda client: client.areflect(
+                        bank_id=self._bank_id,
+                        query=query,
+                        budget=self._budget,
+                    )
+                )
+                return _RecallResult(response.text or "", 0)
+            logger.debug(
+                "Recall: calling two-lane recall (bank=%s, query_len=%d, budget=%s)",
+                self._bank_id,
+                len(query),
+                self._budget,
+            )
+            bundle = self._recall_bundle(query, mode=AUTOMATIC_RECALL_MODE)
+            return _RecallResult(self._render_recall(bundle), len(bundle.results))
+        except Exception as exc:
+            logger.debug("Hindsight recall failed: %s", exc, exc_info=True)
             return _RecallResult("", 0)
 
     def _format_recall(self, result: str) -> str:
@@ -2022,6 +2247,8 @@ class HindsightMemoryProvider(MemoryProvider):
             metadata["source"] = self._retain_source
         if self._session_id:
             metadata["session_id"] = self._session_id
+        if self._parent_session_id:
+            metadata["parent_session_id"] = self._parent_session_id
         if self._platform:
             metadata["platform"] = self._platform
         if self._user_id:
@@ -2050,6 +2277,8 @@ class HindsightMemoryProvider(MemoryProvider):
         tags: List[str] | None = None,
         retain_async: bool | None = None,
         occurred_at: str | None = None,
+        exact_tags: bool = False,
+        observation_scopes: Any = None,
     ) -> Dict[str, Any]:
         # The item-level timestamp is what the Hindsight server uses to resolve
         # occurred_start/occurred_end (including relative phrases in content).
@@ -2067,24 +2296,36 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs["document_id"] = document_id
         if retain_async is not None:
             kwargs["retain_async"] = retain_async
-        merged_tags = _normalize_retain_tags(self._retain_tags)
+        merged_tags = [] if exact_tags else _normalize_retain_tags(self._retain_tags)
         for tag in _normalize_retain_tags(tags):
             if tag not in merged_tags:
                 merged_tags.append(tag)
         if merged_tags:
             kwargs["tags"] = merged_tags
-        if self._observation_scopes:
-            kwargs["observation_scopes"] = self._observation_scopes
+        effective_scopes = self._observation_scopes if observation_scopes is None else observation_scopes
+        if effective_scopes:
+            kwargs["observation_scopes"] = effective_scopes
         return kwargs
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        """Enqueue a retain for the current turn. Non-blocking.
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: List[Dict[str, Any]] | None = None,
+    ) -> None:
+        """Persist a complete turn before scheduling any network request.
 
-        The actual aretain_batch runs on a single long-lived writer thread
-        that drains an in-memory queue. Once shutdown() has been called,
-        further sync_turn() calls are dropped — this prevents post-exit
-        retains from reaching aiohttp after interpreter shutdown begins.
+        Only the original user text and final assistant text enter this API.
+        Every bounded part has immutable document/turn/part/operation identity;
+        retries load the exact request from disk and reuse the operation UUID.
         """
+        # MemoryManager may provide the full tool-bearing transcript for other
+        # providers. Hindsight intentionally ignores it: tool calls, tool
+        # outputs, and intermediate assistant messages are outside this
+        # conversational-retention boundary.
+        del messages
         if not self._auto_retain:
             logger.debug("sync_turn: skipped (auto_retain disabled)")
             return
@@ -2094,92 +2335,129 @@ class HindsightMemoryProvider(MemoryProvider):
 
         if session_id:
             self._session_id = str(session_id).strip()
+        if self._outbox is None:
+            self._outbox = DurableRetainOutbox(
+                get_hermes_home(),
+                poison_attempts=self._outbox_poison_attempts,
+            )
 
-        turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
-        self._session_turns.append(turn)
+        messages = self._build_turn_messages(str(user_content), str(assistant_content))
+        content = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
+        self._session_turns.append(content)
         self._turn_counter += 1
         self._turn_index = self._turn_counter
-
-        if self._turn_counter % self._retain_every_n_turns != 0:
-            logger.debug("sync_turn: buffered turn %d (will retain at turn %d)",
-                         self._turn_counter, self._turn_counter + (self._retain_every_n_turns - self._turn_counter % self._retain_every_n_turns))
-            return
-
-        document_id, update_mode = self._resolve_retain_target(self._document_id)
-
-        # On append-capable APIs each retain only needs to ship the turns
-        # accumulated since the last retain — the server appends them to the
-        # existing document. On legacy/overwrite APIs we must resend the whole
-        # session because each retain replaces the document.
-        if update_mode == "append":
-            turns_to_retain = self._session_turns[self._last_retained_turn_count:]
-            if not turns_to_retain:
-                logger.debug("sync_turn: skipped append retain; no new turns since last retain")
-                return
-        else:
-            turns_to_retain = list(self._session_turns)
-
-        logger.debug("sync_turn: retaining %d/%d turns, payload %d chars",
-                     len(turns_to_retain), len(self._session_turns),
-                     sum(len(t) for t in turns_to_retain))
-        content = "[" + ",".join(turns_to_retain) + "]"
-
-        lineage_tags: list[str] = []
-        if self._session_id:
-            lineage_tags.append(f"session:{self._session_id}")
-        if self._parent_session_id:
-            lineage_tags.append(f"parent:{self._parent_session_id}")
-
-        # Snapshot the state needed for the retain. The writer may run after
-        # _session_turns / _turn_index are mutated by a later sync_turn().
-        metadata_snapshot = self._build_metadata(
-            message_count=len(turns_to_retain) * 2,
-            turn_index=self._turn_index,
+        turn_id = str(uuid.uuid4())
+        document_uuid = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"hermes-hindsight:{self._integration_profile}:{self._bank_id}:{self._session_id}",
+            )
         )
-        num_turns = len(turns_to_retain)
-        bank_id = self._bank_id
-        retain_async_flag = self._retain_async
-        retain_context = self._retain_context
-
-        def _do_retain() -> None:
+        stable_document_id = f"{self._session_id}-{document_uuid}"
+        document_id, update_mode = self._resolve_retain_target(stable_document_id)
+        bounded_parts = split_text_utf8_safe(content, MAX_CONTENT_CHARACTERS_PER_PART)
+        exact_tags = sealed_conversation_tags(
+            profile=self._integration_profile,
+            scope=self._integration_scope,
+            session_id=self._session_id,
+        )
+        outbox_parts: list[dict[str, Any]] = []
+        for part_index, part_content in enumerate(bounded_parts):
+            part_id = str(uuid.uuid4())
+            operation_id = str(uuid.uuid4())
+            metadata_snapshot = self._build_metadata(message_count=2, turn_index=self._turn_index)
+            metadata_snapshot.update(
+                {
+                    "turn_id": turn_id,
+                    "part_id": part_id,
+                    "part_index": str(part_index),
+                    "part_count": str(len(bounded_parts)),
+                    "document_uuid": document_uuid,
+                }
+            )
             item = self._build_retain_kwargs(
-                content,
-                context=retain_context,
+                part_content,
+                context=self._retain_context,
                 metadata=metadata_snapshot,
-                tags=lineage_tags or None,
+                tags=exact_tags,
+                exact_tags=True,
+                observation_scopes="shared",
             )
             item.pop("bank_id", None)
             item.pop("retain_async", None)
+            part_document_id = document_id
             if update_mode is not None:
                 item["update_mode"] = update_mode
-            logger.debug("Hindsight retain: bank=%s, doc=%s, mode=%s, async=%s, content_len=%d, num_turns=%d",
-                         bank_id, document_id, update_mode, retain_async_flag, len(content), num_turns)
-            resp = self._run_hindsight_operation(
-                lambda client: client.aretain_batch(
-                    bank_id=bank_id,
-                    items=[item],
-                    document_id=document_id,
-                    retain_async=retain_async_flag,
-                )
+            else:
+                # A legacy replace-only API gets one immutable document per
+                # part so a later retry/turn cannot overwrite earlier content.
+                part_document_id = part_id
+            request = {
+                "bank_id": self._bank_id,
+                "items": [item],
+                "document_id": part_document_id,
+                # v0.8.6 operation_id idempotency is defined for async retains.
+                "retain_async": True,
+                "operation_id": operation_id,
+            }
+            request_bytes = len(
+                json.dumps(request, ensure_ascii=True).encode("utf-8")
             )
-            # For async retains the write is only *accepted* here; track the
-            # returned operation id(s) so the next-turn prefetch can wait for
-            # true server-side completion (read-after-write) before recalling.
-            if retain_async_flag:
-                self._track_retain_ops(resp, bank_id)
-            logger.debug("Hindsight retain succeeded")
+            if request_bytes >= MAX_GATEWAY_BODY_BYTES:
+                raise ValueError(
+                    "Hindsight retain request envelope exceeds the 2 MiB gateway limit; "
+                    "reduce retain_context or identity metadata"
+                )
+            outbox_parts.append(
+                {
+                    "part_index": part_index,
+                    "part_id": part_id,
+                    "operation_id": operation_id,
+                    "payload_sha256": immutable_json_sha256(request),
+                    "request": request,
+                    "delivery": {
+                        "attempts": 0,
+                        "acked": False,
+                        "poisoned": False,
+                    },
+                }
+            )
 
+        ready = self._turn_counter % self._retain_every_n_turns == 0
+        self._outbox.put_turn(
+            {
+                "turn_id": turn_id,
+                "turn_index": self._turn_index,
+                "session_id": self._session_id,
+                "profile": self._integration_profile,
+                "scope": self._integration_scope,
+                "bank_id": self._bank_id,
+                "document_id": document_id,
+                "document_uuid": document_uuid,
+                "ready": ready,
+                "parts": outbox_parts,
+            }
+        )
+        if not ready:
+            logger.debug(
+                "sync_turn: durably buffered turn %d (flush boundary %d)",
+                self._turn_counter,
+                self._retain_every_n_turns,
+            )
+            return
+
+        jobs = self._outbox.promote_session(
+            self._bank_id,
+            self._session_id,
+            through_turn=self._turn_counter,
+        )
         self._ensure_writer()
         self._register_atexit()
-        # Deterministic "saving to memory" indicator — emitted the moment a
-        # real retain is dispatched (past every skip/buffer gate above), so it
-        # only fires on turns that actually persist.
-        self._emit_saving_indicator()
-        self._retain_queue.put(_do_retain)
-        # Advance the append watermark only after the delta is queued, so a
-        # later retain doesn't re-ship turns we've already handed to the writer.
-        if update_mode == "append":
-            self._last_retained_turn_count = len(self._session_turns)
+        if jobs:
+            # Emit only after a durable outbox promotion produced real jobs.
+            self._emit_saving_indicator()
+        for job in jobs:
+            self._retain_queue.put(job)
 
     def _emit_saving_indicator(self) -> None:
         """Surface a model-independent "saving to memory" status line.
@@ -2233,24 +2511,25 @@ class HindsightMemoryProvider(MemoryProvider):
             if not query:
                 return tool_error("Missing required parameter: query")
             try:
-                recall_kwargs: dict = {
-                    "bank_id": self._bank_id, "query": query, "budget": self._budget,
-                    "max_tokens": self._recall_max_tokens,
-                }
-                if self._recall_tags:
-                    recall_kwargs["tags"] = self._recall_tags
-                    recall_kwargs["tags_match"] = self._recall_tags_match
-                if self._recall_types:
-                    recall_kwargs["types"] = self._recall_types
-                logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                             self._bank_id, len(query), self._budget)
-                resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                num_results = len(resp.results) if resp.results else 0
-                logger.debug("Tool hindsight_recall: %d results", num_results)
-                if not resp.results:
+                mode = str(args.get("mode") or AUTOMATIC_RECALL_MODE)
+                bundle = self._recall_bundle(
+                    query,
+                    mode=mode,
+                    source_facts_max_tokens=args.get("source_facts_max_tokens"),
+                )
+                logger.debug(
+                    "Tool hindsight_recall: bank=%s mode=%s results=%d",
+                    self._bank_id,
+                    mode,
+                    len(bundle.results),
+                )
+                if not bundle.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
-                return json.dumps({"result": "\n".join(lines)})
+                text = self._render_recall(
+                    bundle,
+                    include_source_content=mode == FULL_PROVENANCE_MODE,
+                )
+                return json.dumps({"result": text or "No relevant memories found."})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to search memory: {e}")
@@ -2283,122 +2562,48 @@ class HindsightMemoryProvider(MemoryProvider):
         reset: bool = False,
         **kwargs,
     ) -> None:
-        """Refresh cached per-session state when the agent rotates session_id.
-
-        Fires on /resume, /branch, /reset, /new, and context compression.
-        Without this hook, initialize()-cached state (``_session_id``,
-        ``_document_id``, ``_session_turns``, ``_turn_counter``) would keep
-        pointing at the previous session and writes would land in the wrong
-        document. See hermes-agent#6672.
-
-        Always update ``_session_id`` so metadata and tags on subsequent
-        retains reflect the active session. Always mint a fresh
-        ``_document_id`` so the new session's retain doesn't overwrite the
-        old session's document on vectorize-io/hindsight#1303. Always clear
-        the accumulated batch buffers (``_session_turns``, ``_turn_counter``,
-        ``_turn_index``) — even for /resume and /branch, the new session's
-        batching must start from zero so an in-flight retain doesn't flush
-        under the wrong ``_document_id``.
-
-        Before clearing, flush any buffered turns under the *old*
-        ``_document_id``. Users who set ``retain_every_n_turns > 1`` would
-        otherwise silently lose whatever's in ``_session_turns`` at the
-        moment of switch — the same data-loss class as the shutdown race,
-        just at a different lifecycle event.
-
-        Also wait for any in-flight prefetch from the old session and drop
-        its cached result; otherwise the new session's first ``prefetch()``
-        could read stale recall text from before the switch.
-
-        ``parent_session_id`` is recorded for lineage tags on future retains.
-        ``reset`` is accepted but not needed for Hindsight's state model —
-        buffer clearing is correct for every session switch, not only /reset.
-        """
+        """Flush durable old-session intents, then rotate all cached state."""
         new_id = str(new_session_id or "").strip()
         if not new_id:
             return
 
-        # 1. Flush any buffered turns under the OLD identifiers. Snapshot
-        # everything before mutating self._* so metadata + tags + doc_id
-        # all reference the old session consistently.
-        if self._session_turns:
-            old_turns = list(self._session_turns)
-            old_session_id = self._session_id
-            old_parent_session_id = self._parent_session_id
-            old_turn_index = self._turn_index
-            old_metadata = self._build_metadata(
-                message_count=len(old_turns) * 2,
-                turn_index=old_turn_index,
-            )
-            old_lineage_tags: list[str] = []
-            if old_session_id:
-                old_lineage_tags.append(f"session:{old_session_id}")
-            if old_parent_session_id:
-                old_lineage_tags.append(f"parent:{old_parent_session_id}")
-            old_content = "[" + ",".join(old_turns) + "]"
-            # Resolve doc_id + update_mode against the OLD session BEFORE
-            # we rotate _session_id, so the flush lands in the old
-            # session's document either way (legacy: per-process unique;
-            # ≥0.5.0: stable session-scoped + append).
-            old_document_id, old_update_mode = self._resolve_retain_target(
-                self._document_id
-            )
-
-            def _flush():
-                try:
-                    item = self._build_retain_kwargs(
-                        old_content,
-                        context=self._retain_context,
-                        metadata=old_metadata,
-                        tags=old_lineage_tags or None,
-                    )
-                    item.pop("bank_id", None)
-                    item.pop("retain_async", None)
-                    if old_update_mode is not None:
-                        item["update_mode"] = old_update_mode
-                    logger.debug(
-                        "Hindsight flush-on-switch: bank=%s, doc=%s, mode=%s, num_turns=%d",
-                        self._bank_id, old_document_id, old_update_mode, len(old_turns),
-                    )
-                    self._run_hindsight_operation(
-                        lambda client: client.aretain_batch(
-                            bank_id=self._bank_id,
-                            items=[item],
-                            document_id=old_document_id,
-                            retain_async=self._retain_async,
-                        )
-                    )
-                except Exception as e:
-                    logger.warning("Hindsight flush-on-switch failed: %s", e, exc_info=True)
-
-            # Route the flush through the same writer queue sync_turn
-            # uses. That serializes it behind any still-queued retains
-            # from the old session (FIFO by document_id), avoids racing
-            # two threads on aretain_batch against the same document, and
-            # keeps shutdown's drain semantics intact. Skip enqueue if
-            # shutdown has already fired — the writer is draining/gone.
-            if not self._shutting_down.is_set():
+        old_session_id = self._session_id
+        outbox = getattr(self, "_outbox", None)
+        if outbox is not None and old_session_id and not self._shutting_down.is_set():
+            jobs = outbox.promote_session(self._bank_id, old_session_id)
+            if jobs:
                 self._ensure_writer()
                 self._register_atexit()
-                self._retain_queue.put(_flush)
+                for job in jobs:
+                    self._retain_queue.put(job)
 
-        # 2. Drain any in-flight prefetch from the old session and drop
-        # its cached result so the new session doesn't see stale recall.
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
             self._prefetch_result = ""
 
-        # 3. Now rotate to the new session.
         if parent_session_id:
             self._parent_session_id = str(parent_session_id).strip()
         self._session_id = new_id
-        start_ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        self._document_id = f"{self._session_id}-{start_ts}"
+        integration_profile = getattr(self, "_integration_profile", "default")
+        document_uuid = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"hermes-hindsight:{integration_profile}:{self._bank_id}:{self._session_id}",
+            )
+        )
+        self._document_id = f"{self._session_id}-{document_uuid}"
         self._session_turns = []
-        self._turn_counter = 0
-        self._turn_index = 0
-        self._last_retained_turn_count = 0
+        if outbox is not None:
+            self._turn_counter = outbox.max_known_turn(self._bank_id, self._session_id)
+            self._last_retained_turn_count = outbox.contiguous_acked_turn(
+                self._bank_id,
+                self._session_id,
+            )
+        else:
+            self._turn_counter = 0
+            self._last_retained_turn_count = 0
+        self._turn_index = self._turn_counter
         logger.debug(
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
             self._session_id, self._parent_session_id, reset, self._document_id,
@@ -2406,6 +2611,15 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
+        # Turns below a retain_every_n_turns boundary are already durable but
+        # not dispatchable.  Promote them before closing so normal shutdown is
+        # a flush; a process kill still leaves them recoverable on disk.
+        if self._outbox is not None and self._session_id and not self._shutting_down.is_set():
+            jobs = self._outbox.promote_session(self._bank_id, self._session_id)
+            if jobs:
+                self._ensure_writer()
+                for job in jobs:
+                    self._retain_queue.put(job)
         # Stop accepting new retain jobs first so anyone still calling
         # sync_turn() during teardown is dropped, not enqueued.
         self._shutting_down.set()

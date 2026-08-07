@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -81,9 +82,10 @@ def _make_mock_client():
     client.arecall = AsyncMock(
         return_value=SimpleNamespace(
             results=[
-                SimpleNamespace(text="Memory 1"),
-                SimpleNamespace(text="Memory 2"),
-            ]
+                SimpleNamespace(id="memory-1", text="Memory 1", source_fact_ids=[]),
+                SimpleNamespace(id="memory-2", text="Memory 2", source_fact_ids=[]),
+            ],
+            source_facts={},
         )
     )
     client.areflect = AsyncMock(
@@ -263,7 +265,7 @@ class TestConfig:
         assert provider._recall_max_tokens == 4096
         assert provider._recall_max_input_chars == 800
         assert provider._tags is None
-        assert provider._observation_scopes is None
+        assert provider._observation_scopes == "shared"
         assert provider._recall_tags is None
         # Default recall narrowed to observation-only; world/experience are
         # aggregate facts that often crowd out concrete-event signal during
@@ -528,7 +530,8 @@ class TestToolHandlers:
         first_client.arecall.side_effect = RuntimeError("Cannot connect to host 127.0.0.1:8888")
         second_client = _make_mock_client()
         second_client.arecall.return_value = SimpleNamespace(
-            results=[SimpleNamespace(text="Recovered memory")]
+            results=[SimpleNamespace(id="recovered", text="Recovered memory", source_fact_ids=[])],
+            source_facts={},
         )
         clients = iter([first_client, second_client])
 
@@ -542,8 +545,8 @@ class TestToolHandlers:
 
         assert result["result"] == "1. Recovered memory"
         assert provider._client is second_client
-        first_client.arecall.assert_called_once()
-        second_client.arecall.assert_called_once()
+        assert first_client.arecall.call_count == 2
+        assert second_client.arecall.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +580,7 @@ class TestPrefetch:
 
         assert captured["query"] == "fix tests"       # current query, not ignored
         assert "fresh memory" in result
-        p._client.arecall.assert_called_once()
+        assert p._client.arecall.call_count == 2
 
     def test_recall_sync_skips_background_queue(self, provider_with_config):
         # With sync recall there's nothing to prime in the background.
@@ -685,7 +688,7 @@ class TestPrefetchServerRetainVisibility:
         provider._retain_queue.join()
         assert {"op-a", "op-b"} <= provider._pending_retain_ops
 
-    def test_sync_retain_tracks_no_ops(self, provider_with_config):
+    def test_compat_retain_async_false_still_tracks_durable_async_op(self, provider_with_config):
         p = provider_with_config(retain_async=False)
         p._client = _make_mock_client()
         p._client.aretain_batch = AsyncMock(
@@ -693,8 +696,9 @@ class TestPrefetchServerRetainVisibility:
         )
         p.sync_turn("hello", "world")
         p._retain_queue.join()
-        # retain_async=False → no server-side op to wait on.
-        assert p._pending_retain_ops == set()
+        # Durable outbox dispatch intentionally forces async operation-id
+        # idempotency even when the legacy compatibility setting is false.
+        assert p._pending_retain_ops == {"op-x"}
 
     def test_prefetch_waits_for_server_completion_before_recall(self, provider):
         """Recall must not run until the tracked async op reports completed."""
@@ -717,7 +721,7 @@ class TestPrefetchServerRetainVisibility:
 
         # Recall ran, the op was polled to completion, and the pending set
         # was cleared (so a later prefetch won't re-poll it).
-        assert order == ["recall"]
+        assert order == ["recall", "recall"]
         assert provider._client.operations.get_operation_status.await_count >= 3
         assert provider._pending_retain_ops == set()
 
@@ -743,7 +747,7 @@ class TestPrefetchServerRetainVisibility:
             p._prefetch_thread.join(timeout=5.0)
         elapsed = time.monotonic() - start
 
-        assert order == ["recall"], "prefetch should recall after the timeout"
+        assert order == ["recall", "recall"], "prefetch should run both recall lanes after the timeout"
         assert elapsed < 3.0, "prefetch must not block well past the drain budget"
 
     def test_timed_out_ops_are_dropped_not_repolled(self, provider_with_config):
@@ -918,18 +922,25 @@ class TestSyncTurn:
         p._client.aretain_batch.assert_called_once()
         call_kwargs = p._client.aretain_batch.call_args.kwargs
         assert call_kwargs["bank_id"] == "test-bank"
-        assert call_kwargs["document_id"].startswith("session-1-")
+        UUID(call_kwargs["document_id"][-36:])
+        UUID(call_kwargs["operation_id"])
         assert call_kwargs["retain_async"] is True
         assert len(call_kwargs["items"]) == 1
         item = call_kwargs["items"][0]
         assert item["context"] == "conversation between Hermes Agent and the User"
-        assert item["tags"] == ["conv", "session1", "session:session-1"]
+        assert item["tags"] == [
+            "runtime:hermes",
+            "profile:fakeassistantname",
+            "scope:personal",
+            "session:session-1",
+        ]
+        assert item["observation_scopes"] == "shared"
         content = json.loads(item["content"])
-        assert len(content) == 1
-        assert content[0][0]["role"] == "user"
-        assert content[0][0]["content"] == "User (fakeusername): hello"
-        assert content[0][1]["role"] == "assistant"
-        assert content[0][1]["content"] == "Assistant (fakeassistantname): hi there"
+        assert len(content) == 2
+        assert content[0]["role"] == "user"
+        assert content[0]["content"] == "User (fakeusername): hello"
+        assert content[1]["role"] == "assistant"
+        assert content[1]["content"] == "Assistant (fakeassistantname): hi there"
         assert item["metadata"]["source"] == "hermes"
         assert item["metadata"]["session_id"] == "session-1"
         assert item["metadata"]["platform"] == "discord"
@@ -942,8 +953,11 @@ class TestSyncTurn:
         assert item["metadata"]["agent_identity"] == "fakeassistantname"
         assert item["metadata"]["turn_index"] == "1"
         assert item["metadata"]["message_count"] == "2"
-        assert content[0][0]["timestamp"] == event_time.isoformat(timespec="seconds")
-        assert content[0][1]["timestamp"] == event_time.isoformat(timespec="seconds")
+        UUID(item["metadata"]["turn_id"])
+        UUID(item["metadata"]["part_id"])
+        UUID(item["metadata"]["document_uuid"])
+        assert content[0]["timestamp"] == event_time.isoformat(timespec="seconds")
+        assert content[1]["timestamp"] == event_time.isoformat(timespec="seconds")
         assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", item["metadata"]["retained_at"])
         assert item["timestamp"] == event_time.isoformat(timespec="seconds")
 
@@ -980,9 +994,8 @@ class TestSyncTurn:
             await client.aclose()
 
 
-    def test_resume_creates_new_document(self, tmp_path, monkeypatch):
-        """Resuming a session (re-initializing) gets a new document_id
-        so previously stored content is not overwritten."""
+    def test_resume_reuses_stable_document_uuid(self, tmp_path, monkeypatch):
+        """Resuming a session reuses append-safe document identity."""
         config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
         config_path = tmp_path / "hindsight" / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -992,17 +1005,11 @@ class TestSyncTurn:
         p1 = HindsightMemoryProvider()
         p1.initialize(session_id="resumed-session", hermes_home=str(tmp_path), platform="cli")
 
-        # Sleep just enough that the microsecond timestamp differs
-        import time
-        time.sleep(0.001)
-
         p2 = HindsightMemoryProvider()
         p2.initialize(session_id="resumed-session", hermes_home=str(tmp_path), platform="cli")
 
-        # Same session, but each process gets its own document_id
-        assert p1._document_id != p2._document_id
-        assert p1._document_id.startswith("resumed-session-")
-        assert p2._document_id.startswith("resumed-session-")
+        assert p1._document_id == p2._document_id
+        UUID(p1._document_id[-36:])
 
 
 # ---------------------------------------------------------------------------
@@ -1103,10 +1110,20 @@ class TestShutdownRace:
 
 
 class TestSessionSwitchBufferFlush:
-    def test_buffered_turns_flushed_before_clear(self, provider_with_config):
+    def test_buffered_turns_flushed_before_clear(self, provider_with_config, monkeypatch):
         """retain_every_n_turns > 1 must not silently drop partial buffers
         on session switch. Whatever's in _session_turns at switch time
         should land in the OLD document under the OLD session id."""
+        monkeypatch.setattr(
+            "plugins.memory.hindsight._fetch_hindsight_api_version",
+            lambda *a, **kw: "0.8.6",
+        )
+        from plugins.memory.hindsight import (
+            _append_capability_cache,
+            _append_capability_lock,
+        )
+        with _append_capability_lock:
+            _append_capability_cache.clear()
         p = provider_with_config(retain_every_n_turns=3, retain_async=False)
         old_doc = p._document_id
 
@@ -1122,25 +1139,23 @@ class TestSessionSwitchBufferFlush:
         p.on_session_switch("new-sid", parent_session_id="test-session", reset=True)
         p._retain_queue.join()
 
-        p._client.aretain_batch.assert_called_once()
-        kw = p._client.aretain_batch.call_args.kwargs
-        assert kw["document_id"] == old_doc
-        item = kw["items"][0]
-        # Both buffered turns must be present in the flushed payload.
-        content = json.loads(item["content"])
-        flat = json.dumps(content)
-        assert "turn1-user" in flat
-        assert "turn2-user" in flat
-        # Old session id must appear in lineage tags / metadata.
-        assert "session:test-session" in item["tags"]
-        assert item["metadata"]["session_id"] == "test-session"
+        assert p._client.aretain_batch.call_count == 2
+        calls = [call.kwargs for call in p._client.aretain_batch.call_args_list]
+        assert {call["document_id"] for call in calls} == {old_doc}
+        bodies = [call["items"][0]["content"] for call in calls]
+        assert sum("turn1-user" in body for body in bodies) == 1
+        assert sum("turn2-user" in body for body in bodies) == 1
+        for call in calls:
+            item = call["items"][0]
+            assert "session:test-session" in item["tags"]
+            assert item["metadata"]["session_id"] == "test-session"
 
         # And the new session must start with a clean slate.
         assert p._session_id == "new-sid"
         assert p._session_turns == []
         assert p._turn_counter == 0
         assert p._document_id != old_doc
-        assert p._document_id.startswith("new-sid-")
+        UUID(p._document_id[-36:])
 
 
     def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
@@ -1213,16 +1228,9 @@ class TestSessionSwitchBufferFlush:
         gate.set()
         p._retain_queue.join()
 
-        # The flush carries all buffered turns; sync_turn's retain #2
-        # carried the batch at boundary time. Two distinct calls.
-        assert p._client.aretain_batch.call_count == 2
-        # First call landed while buffer was [t1, t2]; flush landed
-        # after we added t3. So the second call must be strictly after.
-        assert call_order[0] == "2"
-        # Flush retain has turn_index matching the buffered count at
-        # switch time (3 turns accumulated, _turn_index was set to 3
-        # by the last sync_turn).
-        assert call_order[1] == "3"
+        # Durable promotion writes one operation per turn in FIFO order.
+        assert p._client.aretain_batch.call_count == 3
+        assert call_order == ["1", "2", "3"]
 
 
 # ---------------------------------------------------------------------------
@@ -1244,13 +1252,13 @@ class TestUpdateModeAppendCapability:
             "plugins.memory.hindsight._fetch_hindsight_api_version",
             lambda *a, **kw: None,
         )
-        old_doc = provider._document_id
         provider.sync_turn("hello", "hi")
         provider._retain_queue.join()
 
         kw = provider._client.aretain_batch.call_args.kwargs
-        assert kw["document_id"] == old_doc
-        assert kw["document_id"].startswith("test-session-")
+        UUID(kw["document_id"])
+        assert kw["document_id"] == kw["items"][0]["metadata"]["part_id"]
+        assert kw["document_id"] != provider._document_id
         item = kw["items"][0]
         assert "update_mode" not in item
 
@@ -1265,8 +1273,8 @@ class TestUpdateModeAppendCapability:
         provider._retain_queue.join()
 
         kw = provider._client.aretain_batch.call_args.kwargs
-        # Stable: just the session id, no per-process timestamp suffix.
-        assert kw["document_id"] == "test-session"
+        assert kw["document_id"] == provider._document_id
+        UUID(kw["document_id"][-36:])
         item = kw["items"][0]
         assert item["update_mode"] == "append"
 
@@ -1288,8 +1296,9 @@ class TestUpdateModeAppendCapability:
         p._retain_queue.join()
 
         kw = p._client.aretain_batch.call_args.kwargs
-        # Flush goes to the OLD session's stable doc, not new-sid's.
-        assert kw["document_id"] == "test-session"
+        # Flush goes to the old session's stable append-safe document.
+        assert kw["document_id"].startswith("test-session-")
+        UUID(kw["document_id"][-36:])
         assert kw["items"][0]["update_mode"] == "append"
 
 
@@ -1626,7 +1635,7 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         calls = self._init_with_outdated_client(
             tmp_path, monkeypatch, InstallSpecsResult(ok=True)
         )
-        assert calls == [(f"hindsight-client>={_MIN_CLIENT_VERSION}",)]
+        assert calls == [(f"hindsight-client=={_MIN_CLIENT_VERSION}",)]
 
     def test_blocked_upgrade_is_nonfatal_and_surfaces_reason(
         self, tmp_path, monkeypatch, caplog

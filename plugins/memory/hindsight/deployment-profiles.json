@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "hindsight_client": "0.8.6",
+  "required_config": {
+    "auto_retain": true,
+    "retain_async": true,
+    "retain_every_n_turns": 1,
+    "observation_scopes": "shared"
+  },
+  "limits": {
+    "maximum_content_characters_per_part": 190000,
+    "maximum_gateway_body_bytes": 2097152,
+    "minimum_recall_max_tokens": 2
+  },
+  "services": [
+    "hermes-gateway.service",
+    "hermes-gateway-tyler.service",
+    "hermes-gateway-alvey.service"
+  ],
+  "profiles": [
+    {
+      "profile": "default",
+      "hermes_home": "~/.hermes",
+      "credential": "hermes-default",
+      "stack": "business",
+      "scope": "business",
+      "bank_id": "aivex-operations"
+    },
+    {
+      "profile": "aivex",
+      "hermes_home": "~/.hermes/profiles/aivex",
+      "credential": "hermes-aivex",
+      "stack": "business",
+      "scope": "business",
+      "bank_id": "aivex-operations"
+    },
+    {
+      "profile": "alvey",
+      "hermes_home": "~/.hermes/profiles/alvey",
+      "credential": "hermes-alvey",
+      "stack": "business",
+      "scope": "business",
+      "bank_id": "client-alvey"
+    },
+    {
+      "profile": "amanda",
+      "hermes_home": "~/.hermes/profiles/amanda",
+      "credential": "hermes-amanda",
+      "stack": "business",
+      "scope": "business",
+      "bank_id": "aivex-operations"
+    },
+    {
+      "profile": "ferguson-employee",
+      "hermes_home": "~/.hermes/profiles/ferguson-employee",
+      "credential": "hermes-ferguson-employee",
+      "stack": "business",
+      "scope": "business",
+      "bank_id": "client-ferguson"
+    },
+    {
+      "profile": "justin-private",
+      "hermes_home": "~/.hermes/profiles/justin-private",
+      "credential": "hermes-justin-private",
+      "stack": "personal",
+      "scope": "personal",
+      "bank_id": "personal-justin-private"
+    },
+    {
+      "profile": "mira",
+      "hermes_home": "~/.hermes/profiles/mira",
+      "credential": "hermes-mira",
+      "stack": "business",
+      "scope": "business",
+      "bank_id": "aivex-operations"
+    },
+    {
+      "profile": "tyler",
+      "hermes_home": "~/.hermes/profiles/tyler",
+      "credential": "hermes-tyler",
+      "stack": "personal",
+      "scope": "personal",
+      "bank_id": "personal-justin-core"
+    }
+  ]
+}

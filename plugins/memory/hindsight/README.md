@@ -70,37 +70,63 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
-| `recall_max_tokens` | `4096` | Maximum tokens for recall results |
+| `recall_max_tokens` | `4096` | Single maximum for the final rendered context. Automatic recall allocates 55% to shared observations, 35% to raw facts, and reserves the rest for formatting. |
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
-| `recall_tags` | — | Tags to filter when searching memories |
-| `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
-| `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
+| `recall_tags` | — | Legacy compatibility setting; automatic recall does not use it. |
+| `recall_tags_match` | `any` | Legacy compatibility setting; automatic observation recall always uses an exact empty tag set. |
+| `recall_types` | `observation` | Legacy compatibility setting; automatic recall uses sealed observation and world/experience lanes. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
 
-> **Behavior change — `recall_types` defaults to `observation` only.**
->
-> Previously recall returned all three fact types. It now returns only observations.
->
-> Per [Hindsight's docs](https://hindsight.vectorize.io/developer/observations), observations are the **consolidated** knowledge layer Hindsight builds on top of raw facts: deduplicated beliefs grounded in evidence, refined as new facts arrive, with proof counts and freshness signals. Raw `world` / `experience` facts are the individual supporting evidence that feeds them. For per-turn context injection, observations are denser per token and avoid feeding the model multiple raw facts that one observation already summarizes.
->
-> Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool — both read the same `recall_types` setting (the tool schema has no per-call `types` argument), so narrowing the default narrows both paths.
+Automatic recall issues two requests concurrently. The observation lane requests
+only exact-global observations (`tags: []`, `tags_match: exact`) and asks for
+source IDs without source bodies. The raw lane requests `world` and `experience`
+facts without tag filters. Hermes ranks observations first, drops raw facts already
+covered by an observation's `source_fact_ids`, removes duplicate result IDs, and
+enforces the single configured token budget after formatting. No score floor is
+silently added.
+
+`hindsight_recall` also exposes three explicit audit modes:
+
+- `legacy_observations` searches observation rows with tag fields omitted.
+- `full_provenance` runs the two lanes and includes source bodies under the
+  caller's required `source_facts_max_tokens` sub-budget.
+- `server_mixed` sends one `world`/`experience`/`observation` request with
+  `prefer_observations=true`.
 
 ### Retain
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `auto_retain` | `true` | Automatically retain conversation turns |
-| `retain_async` | `true` | Process retain asynchronously on the Hindsight server |
-| `retain_every_n_turns` | `1` | Retain every N turns (1 = every turn) |
+| `retain_async` | `true` | Compatibility setting. Durable automatic retention always uses async server processing because v0.8.6 operation-id idempotency is defined on that path. |
+| `retain_every_n_turns` | `1` | Dispatch at every Nth turn (1 = every turn). Each intervening turn is journaled immediately and sent individually at the boundary. |
 | `retain_context` | `conversation between Hermes Agent and the User` | Context label for retained memories |
 | `retain_tags` | — | Default tags applied to retained memories; merged with per-call tool tags |
 | `retain_source` | — | Opt-in `metadata.source` attached to retained memories (identifies the storing client, e.g. `hermes`). Empty by default — no attribution tag ships unless you set it. |
 | `retain_indicator` | `true` | Show a `👁️ Hindsight — saving to memory…` status line when a turn is saved. Turn off for customer-facing agents. |
 | `retain_user_prefix` | `User` | Label used before user turns in auto-retained transcripts |
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
+| `observation_scopes` | `shared` | Conversational observations use the literal string `shared`. `['shared']` is rejected because it means a custom tag scope. |
+| `integration_profile` | active profile | Stable value for the `profile:<name>` provenance tag. |
+| `integration_scope` | derived from bank | `personal` or `business`; emitted as `scope:<value>`. |
+| `outbox_poison_attempts` | `5` | Attempts before a failed part remains quarantined while later turns continue. |
+
+Automatic retention stores only the original user message and final assistant
+response—never tool calls or tool outputs. Every turn is split at a UTF-8-safe
+boundary of at most 190,000 characters and written atomically to the profile's
+`$HERMES_HOME/hindsight/outbox-v1` before dispatch. Each part has persisted
+document, turn, part, and operation UUIDs. Exact retries reuse the operation UUID;
+the record is removed only after every part is acknowledged. Automatic tags are
+exactly `runtime:hermes`, `profile:<profile>`, `scope:<personal|business>`, and
+`session:<session_id>`.
+
+The credential-free rollout inventory is
+[`deployment-profiles.json`](deployment-profiles.json). It records the root plus
+seven named profile homes, their exact bank/scope boundaries, the three gateway
+services, and the required full-turn retention settings.
 
 ### Integration
 
@@ -147,4 +173,6 @@ Available in `hybrid` and `tools` memory modes:
 
 ## Client Version
 
-Requires `hindsight-client >= 0.6.1`. The plugin auto-upgrades on session start if an older version is detected.
+Requires exactly `hindsight-client 0.8.6` plus `tiktoken` for cl100k-compatible
+final-budget enforcement. The plugin reconciles a mismatched client version on
+session start.
