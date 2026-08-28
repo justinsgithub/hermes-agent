@@ -9,7 +9,7 @@ are limited to OS detection and process launch.
 import json
 import os
 import ntpath
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
@@ -903,6 +903,32 @@ class TestWindowsLockedProfileCopy:
         dst = str(tmp_path / "out" / "Cookies")
         assert bc._copy_auth_file(src, dst) is True
         assert sqlite3.connect(dst).execute("select count(*) from cookies").fetchone()[0] == 1
+
+    def test_copy_auth_file_bounds_busy_backup_before_raw_fallback(self, tmp_path):
+        """Connection.timeout does not bound sqlite3 backup's busy loop."""
+        import sqlite3
+        import hermes_cli.browser_connect as bc
+
+        src = tmp_path / "Cookies"
+        src.write_bytes(b"raw-cookie-db")
+        dst = tmp_path / "out" / "Cookies"
+        source = MagicMock()
+        output = MagicMock()
+
+        def busy_backup(_output, **kwargs):
+            kwargs["progress"](sqlite3.SQLITE_BUSY, 1, 1)
+
+        source.backup.side_effect = busy_backup
+        with patch.object(sqlite3, "connect", side_effect=[source, output]), \
+             patch.object(bc.time, "monotonic", side_effect=[0.0, 11.0]):
+            assert bc._copy_auth_file(str(src), str(dst)) is True
+
+        assert dst.read_bytes() == b"raw-cookie-db"
+        source.backup.assert_called_once()
+        assert source.backup.call_args.kwargs["pages"] == 64
+        assert source.backup.call_args.kwargs["sleep"] == 0.1
+        source.close.assert_called_once()
+        output.close.assert_called_once()
 
     def test_copy_auth_file_plain_for_non_db(self, tmp_path):
         import hermes_cli.browser_connect as bc

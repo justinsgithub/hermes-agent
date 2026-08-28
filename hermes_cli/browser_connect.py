@@ -564,6 +564,12 @@ _SQLITE_AUTH_DBS = frozenset({
     "Cookies", "Login Data", "Login Data For Account", "Web Data",
 })
 
+# sqlite3.connect(timeout=...) bounds lock acquisition for SQL statements, but
+# Connection.backup() has its own busy-retry loop and can otherwise wait
+# forever while a live browser holds a long transaction. Keep the whole auth
+# snapshot attempt bounded; the caller can then try the existing raw-copy
+# fallback or fail closed instead of hanging browser launch indefinitely.
+_AUTH_DB_BACKUP_TIMEOUT_SECONDS = 10.0
 
 def _copy_auth_file(src_file: str, dst_file: str) -> bool:
     """Copy one auth file, lock-aware. Returns True on success.
@@ -585,8 +591,22 @@ def _copy_auth_file(src_file: str, dst_file: str) -> bool:
             try:
                 out = sqlite3.connect(dst_file)
                 try:
+                    deadline = time.monotonic() + _AUTH_DB_BACKUP_TIMEOUT_SECONDS
+
+                    def _backup_progress(_status, _remaining, _total):
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                "browser auth database backup exceeded "
+                                f"{_AUTH_DB_BACKUP_TIMEOUT_SECONDS:.0f}s"
+                            )
+
                     with out:
-                        source.backup(out)
+                        source.backup(
+                            out,
+                            pages=64,
+                            progress=_backup_progress,
+                            sleep=0.1,
+                        )
                 finally:
                     out.close()
             finally:
