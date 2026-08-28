@@ -1,19 +1,19 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-28T01:01:28-07:00_
+_Last updated: 2026-08-28T07:21:51-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
 - Branch: `main`
-- Snapshot base commit: `1a8188bbfc fix(browser): bound real-profile auth backup waits`
+- Snapshot base commit: `2e6d1c686b docs: record Hermes upstream and browser cutover`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
 - Working tree: `clean`
 - Recent commits:
+  - `2e6d1c686b docs: record Hermes upstream and browser cutover`
   - `1a8188bbfc fix(browser): bound real-profile auth backup waits`
   - `7acd92d20f chore(local): baseline live Hermes runtime fixes`
   - `c32333dfae feat(memory): harden Hindsight retention and recall`
   - `2b26aa6dd8 docs: record Hermes memory bypass state`
-  - `92a9d0fbf3 feat(api): support explicit memory bypass`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -85,6 +85,12 @@ web-extraction backend for both.
   profiles, preserving independent search-provider selection.
 - Migrated both live configs from version 30 to 39 and installed Hermes 0.20.6,
   `hindsight-client` 0.8.6, and `firecrawl-py` 4.17.0 into the production venv.
+- Replaced the vulnerable uv-managed Python 3.11.15 / SQLite 3.50.4 runtime
+  with a checkout-scoped Python 3.11.16 built from the official source and
+  linked by RUNPATH to a private SQLite 3.53.4 build. SQLite was configured
+  with `--all` so Hermes retains FTS5/FTS4, RTREE, GEOPOLY, SESSION, DBPAGE,
+  DBSTAT, CARRAY, and JSON support. The previous venv is parked beside `venv`
+  as `venv.stale.runtime-1787926352-2873696-b367df54` for rollback.
 
 ## Verification
 
@@ -105,14 +111,34 @@ web-extraction backend for both.
 - Live runtime proof: both `hermes-gateway.service` and
   `hermes-gateway-tyler.service` are active/running with `NRestarts=0` on the
   reconciled editable checkout.
+- Runtime source verification: Python 3.11.16 tarball SHA-256
+  `91bcdebfdde239a003ae93738a7fce0f9230fee5c4bc2b86f6e6e8c6f98aabe8`;
+  SQLite 3.53.4 autoconf tarball SHA3-256
+  `454e45f61c6bd75b7420e7190732dea03ce6639c63ada47bbc592f67fc340338`.
+  Hermes's own runtime predicate reports `vulnerable=False`, and the loaded
+  SQLite source id is `bf7c7f30031888f4e796e429ab3978879485813aaca6f641c7b33e4e09459bcc`.
+- Both pre-cutover quick snapshots report zero failed/skipped databases, match
+  every manifest size, and pass `PRAGMA quick_check` under SQLite 3.53.4:
+  default `20260828-140645-sqlite-runtime-cutover`; Tyler
+  `20260828-140942-sqlite-runtime-cutover`. Snapshot directories/files were
+  tightened to modes 0700/0600.
+- Runtime and database verification: the relocatable candidate passed after a
+  real path rename; `uv pip check` passed for 195 packages; the SQLite/runtime
+  suite passed 101 tests with one expected skip; every live default/Tyler DB
+  passed `PRAGMA quick_check`; both offline FTS write-health probes returned
+  `ok`; Hermes doctor reports Python 3.11.16, SQLite 3.53.4, virtualenv active,
+  state.db readable, and both FTS tables. Both gateway processes load the
+  private Python and `libsqlite3.so.3.53.4`, with no WAL-reset or FTS5 warning
+  in the final startup window.
 
 ## Next Work
 
-- Upstream's new doctor warns that every currently available uv-managed Python
-  3.11/3.12/3.13 candidate still links SQLite 3.50.4 or 3.47.1, which carry the
-  WAL-reset bug. The supported private-runtime repair was exercised and failed
-  closed without swapping the venv. Re-run it when the managed catalog offers
-  SQLite 3.51.3+, 3.50.7, or 3.44.6.
+- Official upstream advanced by 88 commits during the runtime repair. Reconcile
+  the six carried commits onto current `origin/main` separately; none of those
+  88 commits changes the SQLite/runtime repair path.
+- Retain the parked vulnerable venv and the two verified state snapshots until
+  the fixed runtime has completed the desired soak window. They are rollback
+  assets, not active code.
 - The pre-update incidental `package-lock.json` delta is preserved in stash
   `d2e1baab560ae481088b9abc4fa77f12aa545aba`; the old untracked generated
   `build/` directory remains excluded from source history.
@@ -133,4 +159,10 @@ web-extraction backend for both.
   `pinned`, which prune excludes unless `include_pinned=true` is explicit.
 - The live main worktree retains only the old generated `build/` directory as an
   untracked artifact; do not mistake it for the editable runtime source.
+- The active interpreter and SQLite library live under
+  `.hermes-runtime/python/cpython-3.11.16-sqlite-3.53.4` and
+  `.hermes-runtime/sqlite-3.53.4`. Do not delete either directory while `venv`
+  points at that interpreter. After any future runtime rebuild, rerun
+  `hermes doctor` and require SQLite 3.51.3+ (or fixed backports 3.50.7/3.44.6)
+  plus FTS5 before restarting the gateways.
 - Aivex Portal is retired. Keep technical continuity here, never in Portal.
