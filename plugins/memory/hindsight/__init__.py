@@ -1253,7 +1253,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_tags", "description": "Default tags applied to retained memories (comma-separated)", "default": ""},
             {"key": "observation_scopes", "description": "How observations are scoped during consolidation. Conversational memory requires the literal string 'shared'; list-shaped ['shared'] is invalid. Advanced non-conversational uses may select per_tag, combined, all_combinations, or explicit tag lists.", "default": "shared"},
             {"key": "integration_profile", "description": "Stable Hermes profile label used in conversational provenance tags (defaults to the active profile)", "default": ""},
-            {"key": "integration_scope", "description": "Isolation scope used in conversational provenance tags (derived from the deployed bank when blank)", "default": "", "choices": ["", "personal", "business"]},
+            {"key": "integration_scope", "description": "Deployment scope used in conversational provenance tags (derived from the deployed bank when blank)", "default": "", "choices": ["", "personal", "business", "universal"]},
             {"key": "retain_source", "description": "Metadata source value attached to retained memories", "default": _DEFAULT_RETAIN_SOURCE},
             {"key": "retain_user_prefix", "description": "Label used before user turns in retained transcripts", "default": "User"},
             {"key": "retain_assistant_prefix", "description": "Label used before assistant turns in retained transcripts", "default": "Assistant"},

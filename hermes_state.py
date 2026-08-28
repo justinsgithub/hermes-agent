@@ -361,6 +361,17 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
+# Request-scoped and scheduler entrypoints should not remain live forever
+# after a crash or an older caller forgets to close them. Interactive sources
+# are intentionally excluded because they may be resumed days later.
+EPHEMERAL_SESSION_SOURCES = (
+    "api_server",
+    "cron",
+    "subagent",
+    "tool",
+    "social",
+)
+
 # How long SessionDB stops attempting read-only opens after one fails, before
 # probing again. Long enough that a genuinely unreadable file isn't retried per
 # query; short enough that transient fd pressure doesn't strand the read pool.
@@ -7235,6 +7246,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (session_id,),
             )
         self._execute_write(_do)
+
+    def finalize_stale_sessions(
+        self,
+        older_than_hours: int = 24,
+        sources: Optional[List[str]] = None,
+        active_session_ids: Optional[List[str]] = None,
+    ) -> int:
+        """End abandoned request-scoped sessions after an inactivity window.
+
+        Freshness uses the same authoritative last-activity expression as the
+        current prune/archive APIs. Archived rows and caller-declared active
+        sessions are never changed.
+        """
+        cutoff = time.time() - (older_than_hours * 3600)
+        source_values = list(sources or EPHEMERAL_SESSION_SOURCES)
+        active_values = [sid for sid in (active_session_ids or []) if sid]
+        if not source_values:
+            return 0
+
+        def _do(conn):
+            source_ph = ",".join("?" * len(source_values))
+            active_sql = ""
+            params: List[Any] = [time.time(), *source_values, cutoff]
+            if active_values:
+                active_ph = ",".join("?" * len(active_values))
+                active_sql = f" AND s.id NOT IN ({active_ph})"
+                params.extend(active_values)
+            cursor = conn.execute(
+                f"""UPDATE sessions AS s
+                    SET ended_at = ?, end_reason = 'stale_inactivity'
+                    WHERE s.ended_at IS NULL
+                      AND s.archived = 0
+                      AND s.source IN ({source_ph})
+                      AND {_sql_session_last_active('s')} < ?
+                      {active_sql}""",
+                params,
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do)
 
     def promote_to_session_reset(
         self, session_id: str, reason: str = "session_reset"

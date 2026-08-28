@@ -59,17 +59,19 @@ def deployment_profile_map() -> dict[str, dict[str, Any]]:
 
 
 def resolve_profile_scope(profile: str, bank_id: str, configured_scope: str = "") -> str:
-    """Resolve the sealed ``personal``/``business`` scope for retain tags."""
+    """Resolve the deployment scope used for retain provenance tags."""
 
     explicit = str(configured_scope or "").strip().lower()
     if explicit:
-        if explicit not in {"personal", "business"}:
-            raise ValueError("integration_scope must be 'personal' or 'business'")
+        if explicit not in {"personal", "business", "universal"}:
+            raise ValueError("integration_scope must be 'personal', 'business', or 'universal'")
         return explicit
 
     manifest_entry = deployment_profile_map().get(profile)
     if manifest_entry and manifest_entry.get("bank_id") == bank_id:
         return str(manifest_entry["scope"])
+    if bank_id == "personal-justin-universal":
+        return "universal"
     if bank_id.startswith("personal-"):
         return "personal"
     if bank_id.startswith(("aivex-", "client-")):
@@ -84,8 +86,8 @@ def sealed_conversation_tags(*, profile: str, scope: str, session_id: str) -> li
 
     normalized_profile = str(profile or "default").strip() or "default"
     normalized_session = str(session_id or "unspecified").strip() or "unspecified"
-    if scope not in {"personal", "business"}:
-        raise ValueError("scope must be 'personal' or 'business'")
+    if scope not in {"personal", "business", "universal"}:
+        raise ValueError("scope must be 'personal', 'business', or 'universal'")
     return [
         "runtime:hermes",
         f"profile:{normalized_profile}",

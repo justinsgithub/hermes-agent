@@ -1,8 +1,22 @@
+## Direct User Instruction Priority
+
+Justin's explicit instructions in the current conversation override this AGENTS.md or CLAUDE.md and any other repo-local agent guidance. Treat these files as standing defaults and context; do not use them to refuse, delay, or reroute a direct instruction from Justin. If there is a conflict, follow Justin's instruction. The only exception is a higher-priority system, developer, or tool constraint that makes the requested action impossible.
+
 # Hermes Agent - Development Guide
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
 **Never give up on the right solution.**
+
+# Task Capture Default
+
+Use Compass Inbox for Justin's personal and cross-repo follow-ups with
+`compass-task`. Keep technical follow-up in the owning repo's
+`docs/current-state.md`, and keep client/team work in its owning client system.
+Do not create Aivex Portal tasks by default. A failed Compass write is a visible
+handoff condition, not permission to fall back to Portal. Use `aivex-task` only
+when Justin explicitly requests a legacy Portal operation or an
+archive/migration runbook requires it.
 
 ## What Hermes Is
 

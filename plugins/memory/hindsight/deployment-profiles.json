@@ -14,73 +14,24 @@
   },
   "services": [
     "hermes-gateway.service",
-    "hermes-gateway-tyler.service",
-    "hermes-gateway-alvey.service"
+    "hermes-gateway-tyler.service"
   ],
   "profiles": [
     {
       "profile": "default",
       "hermes_home": "~/.hermes",
       "credential": "hermes-default",
-      "stack": "business",
-      "scope": "business",
-      "bank_id": "aivex-operations"
-    },
-    {
-      "profile": "aivex",
-      "hermes_home": "~/.hermes/profiles/aivex",
-      "credential": "hermes-aivex",
-      "stack": "business",
-      "scope": "business",
-      "bank_id": "aivex-operations"
-    },
-    {
-      "profile": "alvey",
-      "hermes_home": "~/.hermes/profiles/alvey",
-      "credential": "hermes-alvey",
-      "stack": "business",
-      "scope": "business",
-      "bank_id": "client-alvey"
-    },
-    {
-      "profile": "amanda",
-      "hermes_home": "~/.hermes/profiles/amanda",
-      "credential": "hermes-amanda",
-      "stack": "business",
-      "scope": "business",
-      "bank_id": "aivex-operations"
-    },
-    {
-      "profile": "ferguson-employee",
-      "hermes_home": "~/.hermes/profiles/ferguson-employee",
-      "credential": "hermes-ferguson-employee",
-      "stack": "business",
-      "scope": "business",
-      "bank_id": "client-ferguson"
-    },
-    {
-      "profile": "justin-private",
-      "hermes_home": "~/.hermes/profiles/justin-private",
-      "credential": "hermes-justin-private",
-      "stack": "personal",
-      "scope": "personal",
-      "bank_id": "personal-justin-private"
-    },
-    {
-      "profile": "mira",
-      "hermes_home": "~/.hermes/profiles/mira",
-      "credential": "hermes-mira",
-      "stack": "business",
-      "scope": "business",
-      "bank_id": "aivex-operations"
+      "stack": "universal",
+      "scope": "universal",
+      "bank_id": "personal-justin-universal"
     },
     {
       "profile": "tyler",
       "hermes_home": "~/.hermes/profiles/tyler",
       "credential": "hermes-tyler",
-      "stack": "personal",
-      "scope": "personal",
-      "bank_id": "personal-justin-core"
+      "stack": "universal",
+      "scope": "universal",
+      "bank_id": "personal-justin-universal"
     }
   ]
 }

@@ -639,6 +639,47 @@ class TestDisconnectedAgentReap:
 
         assert create.call_args.kwargs["skip_memory"] is True
 
+    @pytest.mark.asyncio
+    async def test_run_agent_reopens_then_finalizes_request_session(self, adapter):
+        mock_db = MagicMock()
+        mock_agent = MagicMock()
+        mock_agent._session_db = mock_db
+        mock_agent.session_id = "session-123"
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            await adapter._run_agent(
+                user_message="hello",
+                conversation_history=[],
+                session_id="session-123",
+            )
+
+        mock_db.reopen_session.assert_called_once_with("session-123")
+        mock_db.end_session.assert_called_once_with(
+            "session-123", "request_complete"
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_agent_finalizes_failed_request_session(self, adapter):
+        mock_db = MagicMock()
+        mock_agent = MagicMock()
+        mock_agent._session_db = mock_db
+        mock_agent.session_id = "session-err"
+        mock_agent.run_conversation.side_effect = RuntimeError("boom")
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            with pytest.raises(RuntimeError, match="boom"):
+                await adapter._run_agent(
+                    user_message="hello",
+                    conversation_history=[],
+                    session_id="session-err",
+                )
+
+        mock_db.end_session.assert_called_once_with("session-err", "request_error")
+
 
 class TestRunEventCallback:
 

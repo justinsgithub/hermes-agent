@@ -1854,6 +1854,20 @@ class GatewayStreamConsumer:
                                 # tail here so the normal gateway send path does
                                 # not duplicate the visible prefix.
                                 await self._send_fallback_final(self._accumulated)
+                            elif (
+                                self._message_id
+                                and self._last_sent_text
+                                and self._accumulated.strip()
+                            ):
+                                # Finalize edit failed (flood control or other
+                                # transient error), but the streamed message
+                                # already contains the full response text from
+                                # progressive edits.  Mark content as delivered
+                                # so the gateway doesn't send a duplicate
+                                # message with the same text.
+                                _sent_clean = self._last_sent_text.rstrip(self.cfg.cursor).strip()
+                                if _sent_clean and _sent_clean == self._accumulated.strip():
+                                    self._final_content_delivered = True
                         elif not self._already_sent:
                             # Turn-final retry after the finalize tick above
                             # failed (transport error, seal exception).

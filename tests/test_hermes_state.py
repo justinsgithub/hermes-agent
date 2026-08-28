@@ -2901,6 +2901,64 @@ class TestStateMeta:
         assert db.get_meta("foo") == "bar"
 
 
+class TestRetentionSafety:
+    def test_prune_uses_last_activity_not_start_time(self, db):
+        old = time.time() - 100 * 86400
+        recent = time.time() - 3600
+        db.create_session("recently-active", "api_server")
+        db.append_message("recently-active", "user", "still in use", timestamp=recent)
+        db.end_session("recently-active", "request_complete")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (old, "recently-active"),
+        )
+        db._conn.commit()
+
+        assert db.prune_sessions(older_than_days=30) == 0
+        assert db.get_session("recently-active") is not None
+
+    def test_prune_preserves_pinned_session(self, db):
+        old = time.time() - 100 * 86400
+        db.create_session("pinned", "cli")
+        db.end_session("pinned", "done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ?, ended_at = ?, pinned = 1 WHERE id = ?",
+            (old, old, "pinned"),
+        )
+        db._conn.commit()
+
+        assert db.prune_sessions(older_than_days=30) == 0
+        assert db.get_session("pinned") is not None
+
+    def test_finalize_stale_sessions_only_touches_ephemeral_sources(self, db):
+        old = time.time() - 48 * 3600
+        for sid, source in (("api-old", "api_server"), ("cli-old", "cli")):
+            db.create_session(sid, source)
+            db._conn.execute(
+                "UPDATE sessions SET started_at = ? WHERE id = ?", (old, sid)
+            )
+        db._conn.commit()
+
+        assert db.finalize_stale_sessions(older_than_hours=24) == 1
+        assert db.get_session("api-old")["end_reason"] == "stale_inactivity"
+        assert db.get_session("cli-old")["ended_at"] is None
+
+    def test_finalize_stale_sessions_protects_recent_and_active_ids(self, db):
+        old = time.time() - 48 * 3600
+        db.create_session("protected", "api_server")
+        db.create_session("recent", "api_server")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?", (old, "protected")
+        )
+        db._conn.commit()
+
+        assert db.finalize_stale_sessions(
+            older_than_hours=24, active_session_ids=["protected"]
+        ) == 0
+        assert db.get_session("protected")["ended_at"] is None
+        assert db.get_session("recent")["ended_at"] is None
+
+
 
 class TestVacuum:
     def test_vacuum_runs_without_error(self, db):

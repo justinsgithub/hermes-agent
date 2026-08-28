@@ -7318,6 +7318,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     ),
                 )
                 agent = None
+                completed = False
                 try:
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
@@ -7335,6 +7336,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         confirmed_runtime_lock=confirmed_runtime_lock,
                         skip_memory=skip_memory,
                     )
+                    session_db = getattr(agent, "_session_db", None)
+                    if session_db is not None and isinstance(session_id, str) and session_id:
+                        # Responses API chains intentionally resume the same
+                        # request-scoped session across several turns.
+                        session_db.reopen_session(session_id)
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     if active_run_id:
@@ -7446,6 +7452,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         if isinstance(result, dict):
                             result["runtime"] = runtime
                         usage["runtime"] = runtime
+                    completed = True
                     return result, usage
                 except _ProviderAuthResolutionError as exc:
                     # Only _ProviderAuthResolutionError — raised exclusively
@@ -7483,6 +7490,24 @@ class APIServerAdapter(BasePlatformAdapter):
                     if active_run_id:
                         self._active_run_agents.pop(active_run_id, None)
                     if agent is not None:
+                        session_db = getattr(agent, "_session_db", None)
+                        effective_sid = getattr(agent, "session_id", session_id)
+                        if (
+                            session_db is not None
+                            and isinstance(effective_sid, str)
+                            and effective_sid
+                        ):
+                            try:
+                                session_db.end_session(
+                                    effective_sid,
+                                    "request_complete" if completed else "request_error",
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to finalize API session %s: %s",
+                                    effective_sid,
+                                    exc,
+                                )
                         _clear_turn_process_ownership(agent)
                         # Symmetric with the registration above: the turn is
                         # over, so it must not be interrupted by a later

@@ -157,6 +157,12 @@ class TestPermissionErrorHandling:
             # Result may be None (backend skipped) — the key point is no crash
             assert result is None or isinstance(result, str)
 
+    def test_check_tool_call_survives_missing_home_for_tilde_path(self, project):
+        """Tilde-like shell tokens should not crash when expanduser cannot resolve HOME."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        with patch.object(Path, "expanduser", side_effect=RuntimeError("Could not determine home directory")):
+            assert tracker.check_tool_call("terminal", {"command": "printf %s ~/missing"}) is None
+
 
 class TestOutsideWorkspaceRejection:
     """Direct tests for _is_valid_subdir rejecting outside-workspace paths."""

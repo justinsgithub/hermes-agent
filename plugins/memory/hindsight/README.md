@@ -111,7 +111,7 @@ silently added.
 | `retain_assistant_prefix` | `Assistant` | Label used before assistant turns in auto-retained transcripts |
 | `observation_scopes` | `shared` | Conversational observations use the literal string `shared`. `['shared']` is rejected because it means a custom tag scope. |
 | `integration_profile` | active profile | Stable value for the `profile:<name>` provenance tag. |
-| `integration_scope` | derived from bank | `personal` or `business`; emitted as `scope:<value>`. |
+| `integration_scope` | derived from bank | `personal`, `business`, or `universal`; emitted as `scope:<value>`. |
 | `outbox_poison_attempts` | `5` | Attempts before a failed part remains quarantined while later turns continue. |
 
 Automatic retention stores only the original user message and final assistant
@@ -120,13 +120,14 @@ boundary of at most 190,000 characters and written atomically to the profile's
 `$HERMES_HOME/hindsight/outbox-v1` before dispatch. Each part has persisted
 document, turn, part, and operation UUIDs. Exact retries reuse the operation UUID;
 the record is removed only after every part is acknowledged. Automatic tags are
-exactly `runtime:hermes`, `profile:<profile>`, `scope:<personal|business>`, and
+exactly `runtime:hermes`, `profile:<profile>`, `scope:<personal|business|universal>`, and
 `session:<session_id>`.
 
 The credential-free rollout inventory is
-[`deployment-profiles.json`](deployment-profiles.json). It records the root plus
-seven named profile homes, their exact bank/scope boundaries, the three gateway
-services, and the required full-turn retention settings.
+[`deployment-profiles.json`](deployment-profiles.json). The current local
+deployment records only the neutral default and canonical Tyler profile, both
+bound to the single universal bank, plus the required full-turn retention
+settings.
 
 ### Integration
 

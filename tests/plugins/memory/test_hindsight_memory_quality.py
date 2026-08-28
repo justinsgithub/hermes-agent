@@ -248,7 +248,7 @@ class TestRequestContract:
             body = json.dumps(request, ensure_ascii=True).encode("utf-8")
             assert len(body) < MAX_GATEWAY_BODY_BYTES
 
-    def test_manifest_covers_exact_eight_profile_bank_boundaries(self):
+    def test_manifest_covers_exact_two_universal_profiles(self):
         manifest = json.loads(
             (
                 REPO_ROOT
@@ -278,24 +278,10 @@ class TestRequestContract:
             )
             for entry in profiles
         } == {
-            "default": ("business", "aivex-operations", "hermes-default"),
-            "aivex": ("business", "aivex-operations", "hermes-aivex"),
-            "alvey": ("business", "client-alvey", "hermes-alvey"),
-            "amanda": ("business", "aivex-operations", "hermes-amanda"),
-            "ferguson-employee": (
-                "business",
-                "client-ferguson",
-                "hermes-ferguson-employee",
-            ),
-            "justin-private": (
-                "personal",
-                "personal-justin-private",
-                "hermes-justin-private",
-            ),
-            "mira": ("business", "aivex-operations", "hermes-mira"),
-            "tyler": ("personal", "personal-justin-core", "hermes-tyler"),
+            "default": ("universal", "personal-justin-universal", "hermes-default"),
+            "tyler": ("universal", "personal-justin-universal", "hermes-tyler"),
         }
-        assert len({entry["profile"] for entry in profiles}) == 8
+        assert len({entry["profile"] for entry in profiles}) == 2
         for entry in profiles:
             assert resolve_profile_scope(entry["profile"], entry["bank_id"]) == entry["scope"]
             assert sealed_conversation_tags(
