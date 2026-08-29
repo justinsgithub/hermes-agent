@@ -1,19 +1,19 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-28T23:22:11-07:00_
+_Last updated: 2026-08-29T00:00:03-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
 - Branch: `justin/main`
-- Snapshot base commit: `5220a6fe81 Merge remote-tracking branch 'origin/main' into justin/main`
+- Snapshot base commit: `ceeffb7796 Merge remote-tracking branch 'origin/main' into justin/main`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
 - Working tree: `clean`
 - Recent commits:
+  - `ceeffb7796 Merge remote-tracking branch 'origin/main' into justin/main`
+  - `1d8946b40b fix(prompt-caching): tool-using sessions no longer 400 behind LiteLLM Anthropic proxies (#89886)`
+  - `2f59693295 docs: record updater restart-race recovery`
   - `5220a6fe81 Merge remote-tracking branch 'origin/main' into justin/main`
   - `ae637efe7d fix(update): preserve restarted gateway services`
-  - `10e93c6ab9 fix(skills): drop redundant identical-strings guard and its vacuous tests`
-  - `1ff8ec9a49 test(skills): cover the patch recovery loop end to end`
-  - `4f4e778db8 fix(skills): make skill_manage patch failures recoverable instead of a dead end`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -119,6 +119,16 @@ both.
   waits for bounded systemd recovery before performing one explicit restart and
   final interpreter readback. `--repair-services` exposes that recovery gate
   without fetching or changing source.
+- Completed the opt-in v23 FTS storage migration for both live session stores.
+  A stable offline window stopped the default/Tyler gateways, the Tyler
+  `local-hermes-watchdog` timer, the resumable foreground optimizer, and the
+  one interactive local Hermes process holding `state.db`; the separate
+  UID-10000 John/Amanda Docker gateways were not touched. Fresh uncapped
+  SQLite-safe snapshots were created and verified before mutation. The default
+  database shrank from 4,633,100,288 to 1,914,523,648 bytes; Tyler shrank from
+  360,292,352 to 56,864,768 bytes. Both public CLI checks now report the search
+  index is already compact. The two gateways and watchdog timer were restored
+  after verification.
 
 ## Verification
 
@@ -179,6 +189,19 @@ both.
   active on fresh PIDs, Python 3.11.16 / SQLite 3.53.4 / FTS5 ready, 196
   compatible packages, zero commits behind upstream, and `fork/main` matching
   `5220a6fe81`.
+- Session-storage verification: fresh rollback snapshots
+  `20260829-064134-pre-fts-optimize` (default) and
+  `20260829-064441-pre-fts-optimize` (Tyler) have complete manifests with zero
+  failed/oversized databases, source-matching `state.db` sizes, and
+  `PRAGMA quick_check=ok`. Post-migration, both live databases again passed
+  `quick_check`; use the external-content FTS layout; have no optimize,
+  rebuild, teardown, or legacy-trash markers; have exact message/indexed-row
+  parity (271,133 default and 23,497 Tyler); and passed a real FTS `MATCH`
+  probe. `optimize_fts_storage` returned `ok=true, vacuumed=true` for both and
+  reclaimed 3,022,004,224 bytes total. Snapshot directories/files are mode
+  0700/0600, live DBs are 0600, Hermes doctor reports zero freelist pages and
+  zero-byte WALs, and both live gateway processes load Python 3.11.16 with the
+  private SQLite 3.53.4 library (`wal_reset_vulnerable=false`).
 
 ## Update Workflow
 
@@ -207,15 +230,13 @@ push.
 - The pre-update incidental `package-lock.json` delta is preserved in stash
   `d2e1baab560ae481088b9abc4fa77f12aa545aba`; the old untracked generated
   `build/` directory remains excluded from source history.
-- The built-in quick pre-update snapshot skips the 4.3 GB default `state.db`
-  because its quick-snapshot cap is 1 GB. The verified full-size SQLite cutover
-  snapshot remains the current database rollback point; optimize or separately
-  snapshot the large DB before any future update that includes a state schema
-  migration.
-- Hermes now reports that `hermes sessions optimize-storage` can reclaim about
-  2.6 GB from the 4.3 GB default session database's old search-index layout.
-  Before running that foreground rewrite, take and verify a current full-size
-  database snapshot because the routine 1 GB-capped update snapshot skips it.
+- Retain the two verified `pre-fts-optimize` snapshots through the post-migration
+  soak. The compacted default `state.db` is still about 1.8 GiB and therefore
+  remains above the built-in updater's intentional 1 GiB quick-snapshot cap;
+  take another uncapped/manual snapshot before any future state-schema rewrite.
+- Hermes doctor now recommends `sessions.auto_prune` for the default store's
+  11,954 sessions. It remains disabled because enabling deletion is a separate
+  retention-policy decision; storage compaction did not delete conversations.
 
 ## Blockers
 
@@ -245,4 +266,7 @@ push.
   backup, runtime, service, and remote-readback guards all run.
 - Host-visible Docker gateways owned by another UID are separate runtimes and
   must never be signalled by the local checkout's manual-process cleanup.
+- A stable Tyler maintenance stop also requires temporarily stopping
+  `local-hermes-watchdog.timer` and `local-hermes-watchdog.service`; otherwise
+  the watchdog correctly relaunches the gateway while its database is offline.
 - Aivex Portal is retired. Keep technical continuity here, never in Portal.
