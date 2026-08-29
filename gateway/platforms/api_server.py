@@ -7641,6 +7641,20 @@ class APIServerAdapter(BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
+        # Match /v1/responses memory semantics. Durable/background runs must
+        # not silently recall or retain when an authenticated caller requests
+        # a private, memory-bypassed turn.
+        memory_mode = request.headers.get("X-Hermes-Memory", "").strip().lower()
+        if memory_mode not in ("", "enabled", "bypass"):
+            return web.json_response(
+                _openai_error(
+                    "X-Hermes-Memory must be 'enabled' or 'bypass'",
+                    err_type="invalid_request_error",
+                ),
+                status=400,
+            )
+        skip_memory = memory_mode == "bypass"
+
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
         if key_err is not None:
@@ -7806,9 +7820,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
                         requested_provider=agent_overrides.get("requested_provider"),
-                        model_options=agent_overrides.get("model_options"),
-                        route=route,
-                    )
+                            model_options=agent_overrides.get("model_options"),
+                            route=route,
+                            skip_memory=skip_memory,
+                        )
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:

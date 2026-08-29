@@ -1,23 +1,22 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-29T01:10:20-07:00_
+_Last updated: 2026-08-29T08:24:43-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
-- Branch: `justin/main`
-- Snapshot base commit: `540425c2d9 docs: record Hermes auto-prune enablement`
+- Branch: `codex/runs-memory-control`
+- Snapshot base commit: `440c81d887 fix(browser): preserve Linux real-profile logins`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
 - Working tree: `dirty`
 - Status:
-  - ` M hermes_cli/browser_connect.py`
-  - ` M tests/tools/test_browser_real_profile.py`
-  - ` M tools/browser_tool.py`
+  - ` M gateway/platforms/api_server.py`
+  - ` M tests/gateway/test_api_server_runs.py`
 - Recent commits:
+  - `440c81d887 fix(browser): preserve Linux real-profile logins`
   - `540425c2d9 docs: record Hermes auto-prune enablement`
   - `fb2b7bd807 docs: record Hermes session-store compaction`
   - `ceeffb7796 Merge remote-tracking branch 'origin/main' into justin/main`
   - `1d8946b40b fix(prompt-caching): tool-using sessions no longer 400 behind LiteLLM Anthropic proxies (#89886)`
-  - `2f59693295 docs: record updater restart-race recovery`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -72,6 +71,12 @@ both.
 
 ## Recent Changes
 
+- Extended the authenticated native `/v1/runs` endpoint to honor the same
+  `X-Hermes-Memory: enabled|bypass` contract as `/v1/responses`. Durable runs
+  now pass `skip_memory=True` into agent construction for bypassed turns, so
+  background/reconnectable clients cannot accidentally recall or retain a
+  sensitive request. Invalid memory-mode values fail before a run, status, or
+  event queue is created.
 - Reconciled the live checkout from the June upstream base onto current official
   upstream while preserving the unique memory-bypass, Hindsight durability, API
   session-lifecycle, and local runtime fixes. The old one-shot MCP and paused-job
@@ -159,6 +164,10 @@ both.
 
 ## Verification
 
+- `/v1/runs` memory-control regression: the full
+  `tests/gateway/test_api_server_runs.py` suite passed 27/27; focused bypass,
+  invalid-value, and ordinary-start coverage passed 3/3; Ruff and
+  `git diff --check` passed.
 - Pre-rebase live-delta baseline: 531/531 focused tests passed before the local
   changes were committed and replayed.
 - Reconciled patch stack: 276 focused tests passed in the integration worktree;
