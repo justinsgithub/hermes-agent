@@ -45,6 +45,15 @@ for command in git flock systemctl; do
     command -v "$command" >/dev/null 2>&1 || die "required command not found: $command"
 done
 
+# Tool shells and unattended launchers often omit the user-session D-Bus
+# variables even though the systemd user manager is healthy. Bind the canonical
+# local bus explicitly so the final service readback tests the real units rather
+# than failing on shell environment drift.
+user_runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export XDG_RUNTIME_DIR="$user_runtime_dir"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$user_runtime_dir/bus}"
+test -S "$user_runtime_dir/bus" || die "systemd user bus is unavailable: $user_runtime_dir/bus"
+
 test -d "$repo/.git" || die "not a Git checkout: $repo"
 cd "$repo"
 
