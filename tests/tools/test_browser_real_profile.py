@@ -153,44 +153,57 @@ class TestRealProfileCdpLaunch:
     def test_launch_returns_http_cdp(self, tmp_path):
         import tools.browser_tool as bt
         self._reset()
-        proc = Mock(returncode=0, stdout="", stderr="")
         with patch.object(bt, "_use_real_profile", return_value=True), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
-             patch.object(bt, "_agent_browser_get_cdp",
-                          side_effect=[None, "http://127.0.0.1:41000"]), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", return_value=proc), \
-             patch.object(bt, "_is_headed_mode", return_value=False):
+             patch.object(bt, "_direct_profile_cdp", return_value=None), \
+             patch.object(
+                 bt,
+                 "_launch_linux_real_profile_browser",
+                 return_value=("http://127.0.0.1:41000", None),
+             ), \
+             patch.object(bt, "_agent_browser_get_cdp", return_value=None):
             cdp, err = bt._real_profile_cdp()
         assert err is None
         assert cdp == "http://127.0.0.1:41000"
         self._reset()
 
-    def test_launch_never_passes_headless(self, tmp_path):
-        """--headless would use a separate cookie store → 0 real cookies."""
+    def test_linux_launch_uses_libsecret_without_mock_keychain(self, tmp_path):
         import tools.browser_tool as bt
-        self._reset()
-        proc = Mock(returncode=0, stdout="", stderr="")
+        tmp_path.mkdir(exist_ok=True)
         captured = {}
 
-        def fake_run(argv, **kw):
-            captured["argv"] = argv
-            return proc
+        class FakeProc:
+            pid = 4242
 
-        with patch.object(bt, "_use_real_profile", return_value=True), \
-             patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
-             patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
-             patch.object(bt, "_agent_browser_get_cdp",
-                          side_effect=[None, "http://127.0.0.1:41000"]), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", side_effect=fake_run), \
-             patch.object(bt, "_is_headed_mode", return_value=False):
-            bt._real_profile_cdp()
-        assert "--headless" not in captured["argv"]
-        assert "--profile" in captured["argv"]
-        assert str(tmp_path) in captured["argv"]
-        self._reset()
+            @staticmethod
+            def poll():
+                return None
+
+        def fake_popen(argv, **kw):
+            captured["argv"] = argv
+            captured["env"] = kw["env"]
+            return FakeProc()
+
+        with patch(
+            "hermes_cli.browser_connect.chromium_executable",
+            return_value="/opt/google/chrome/chrome",
+        ), patch.object(
+            bt, "_direct_profile_cdp", side_effect=[None, "http://127.0.0.1:41000"]
+        ), patch.object(
+            bt, "_stop_direct_profile_browser"
+        ), patch.object(
+            bt.subprocess, "Popen", side_effect=fake_popen
+        ), patch.object(bt.time, "sleep"):
+            cdp, err = bt._launch_linux_real_profile_browser(
+                "chrome", str(tmp_path)
+            )
+        assert err is None and cdp == "http://127.0.0.1:41000"
+        assert "--password-store=gnome-libsecret" in captured["argv"]
+        assert "--password-store=basic" not in captured["argv"]
+        assert "--use-mock-keychain" not in captured["argv"]
+        assert "--headless=new" in captured["argv"]
+        assert captured["env"]["DBUS_SESSION_BUS_ADDRESS"].startswith("unix:path=")
 
     def test_reuses_only_session_on_our_copy_dir(self, tmp_path):
         """A live session on a DIFFERENT dir (stale/throwaway) is closed, not reused."""
@@ -199,6 +212,7 @@ class TestRealProfileCdpLaunch:
         proc = Mock(returncode=0, stdout="", stderr="")
         closed = {"n": 0}
         with patch.object(bt, "_use_real_profile", return_value=True), \
+             patch.object(bt.sys, "platform", "darwin"), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.snapshot_real_profile", return_value=(str(tmp_path), None)), \
              patch.object(bt, "_agent_browser_get_cdp",
@@ -539,6 +553,11 @@ class TestReviewBugFixes:
         got = (home / "browser-profile" / "chrome" / "Default" / "Cookies").read_text()
         assert got == "PROFILE6-SESSION-AUTH"
         assert (home / "browser-profile" / "chrome" / "Default" / "Login Data").read_text() == "profile6-logins"
+        copied_state = json.loads(
+            (home / "browser-profile" / "chrome" / "Local State").read_text()
+        )
+        assert copied_state["profile"]["last_used"] == "Default"
+        assert copied_state["profile"]["last_active_profiles"] == ["Default"]
 
     def test_last_used_falls_back_to_default(self, tmp_path):
         import hermes_cli.browser_connect as bc
@@ -827,9 +846,7 @@ class TestReviewRound3:
              patch.object(bt, "_using_lightpanda_engine", return_value=False), \
              patch("hermes_cli.browser_connect.detect_default_chromium", return_value="chrome"), \
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
-             patch.object(bt, "_agent_browser_get_cdp", return_value="http://127.0.0.1:9251"), \
-             patch.object(bt, "_cdp_http_ready", return_value=True), \
-             patch.object(bt, "_cdp_on_data_dir", return_value=True), \
+             patch.object(bt, "_direct_profile_cdp", return_value="http://127.0.0.1:9251"), \
              patch("hermes_cli.browser_connect.snapshot_real_profile") as snap:
             cdp, err = bt._real_profile_cdp()
         assert cdp == "http://127.0.0.1:9251" and err is None
@@ -847,11 +864,13 @@ class TestReviewRound3:
              patch("hermes_cli.browser_connect.real_profile_copy_dir", return_value=str(tmp_path)), \
              patch("hermes_cli.browser_connect.snapshot_real_profile",
                    return_value=(str(tmp_path), None)) as snap, \
-             patch.object(bt, "_agent_browser_get_cdp",
-                          side_effect=[None, "http://127.0.0.1:9251"]), \
-             patch.object(bt, "_find_agent_browser", return_value="/usr/bin/agent-browser"), \
-             patch.object(bt.subprocess, "run", return_value=proc), \
-             patch.object(bt, "_is_headed_mode", return_value=False):
+             patch.object(bt, "_direct_profile_cdp", return_value=None), \
+             patch.object(bt, "_agent_browser_get_cdp", return_value=None), \
+             patch.object(
+                 bt,
+                 "_launch_linux_real_profile_browser",
+                 return_value=("http://127.0.0.1:9251", None),
+             ):
             cdp, err = bt._real_profile_cdp()
         assert err is None
         snap.assert_called_once()

@@ -538,6 +538,49 @@ def _last_used_profile(src: str) -> str:
     return last
 
 
+def _normalize_snapshot_profile_selection(dst: str, source_profile: str) -> None:
+    """Make Chromium open the auth-bearing ``Default`` mirror in *dst*.
+
+    ``snapshot_real_profile`` mirrors the user's active source profile into
+    ``Default``.  Copying ``Local State`` verbatim used to leave
+    ``profile.last_used`` pointing at the source name (for example
+    ``Profile 1``), so Chromium created an empty sibling and silently launched
+    signed out while the populated ``Default`` directory sat unused.
+
+    Normalize only the managed copy.  The live source ``Local State`` is never
+    written.  Remove a same-named stale managed directory left by older builds;
+    the snapshot contract intentionally retains only the active profile and its
+    canonical destination is ``Default``.
+    """
+    import json
+
+    local_state = os.path.join(dst, "Local State")
+    try:
+        with open(local_state, encoding="utf-8", errors="replace") as fh:
+            state = json.load(fh)
+        if not isinstance(state, dict):
+            state = {}
+        profile = state.setdefault("profile", {})
+        if not isinstance(profile, dict):
+            profile = {}
+            state["profile"] = profile
+        profile["last_used"] = "Default"
+        profile["last_active_profiles"] = ["Default"]
+        tmp = local_state + ".hermes-tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, separators=(",", ":"))
+        os.replace(tmp, local_state)
+    except (OSError, ValueError, TypeError) as exc:
+        logger.debug("real-profile snapshot: could not normalize Local State: %s", exc)
+
+    if (
+        source_profile != "Default"
+        and source_profile not in ("", ".", "..")
+        and os.path.basename(source_profile) == source_profile
+    ):
+        shutil.rmtree(os.path.join(dst, source_profile), ignore_errors=True)
+
+
 def _secure_snapshot_root(path: str) -> None:
     """Lock down a snapshot dir through Hermes' canonical secret-store policy.
 
@@ -919,6 +962,12 @@ def snapshot_real_profile(browser: str, src: str | None = None) -> tuple[str | N
                 f"({failed_dbs} database(s) locked). Close {browser} and retry, "
                 "or turn browser.use_real_profile off."
             )
+
+        # The active source profile is mirrored into Default above.  Point the
+        # managed copy at that directory instead of preserving the source's
+        # original last_used name, which is not copied and would launch an
+        # empty signed-out profile.
+        _normalize_snapshot_profile_selection(dst, source_profile)
 
         # Never carry live-instance leftovers into the copy.
         for leftover in ("SingletonLock", "SingletonSocket", "SingletonCookie"):

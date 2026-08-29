@@ -1,19 +1,23 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-29T00:10:05-07:00_
+_Last updated: 2026-08-29T01:10:20-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
 - Branch: `justin/main`
-- Snapshot base commit: `fb2b7bd807 docs: record Hermes session-store compaction`
+- Snapshot base commit: `540425c2d9 docs: record Hermes auto-prune enablement`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
-- Working tree: `clean`
+- Working tree: `dirty`
+- Status:
+  - ` M hermes_cli/browser_connect.py`
+  - ` M tests/tools/test_browser_real_profile.py`
+  - ` M tools/browser_tool.py`
 - Recent commits:
+  - `540425c2d9 docs: record Hermes auto-prune enablement`
   - `fb2b7bd807 docs: record Hermes session-store compaction`
   - `ceeffb7796 Merge remote-tracking branch 'origin/main' into justin/main`
   - `1d8946b40b fix(prompt-caching): tool-using sessions no longer 400 behind LiteLLM Anthropic proxies (#89886)`
   - `2f59693295 docs: record updater restart-race recovery`
-  - `5220a6fe81 Merge remote-tracking branch 'origin/main' into justin/main`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -140,6 +144,18 @@ both.
   nothing from Tyler (9,795 unchanged), then both configs were set to
   `sessions.auto_prune: true`. Pinned sessions remain excluded and open sessions
   remain non-prunable.
+- Repaired and fully activated consented real-profile browsing for both live
+  profiles. The toggles were already true, but the prior launch was silently
+  signed out: the snapshot mirrored active source `Profile 1` into `Default`
+  while copied `Local State` still told Chrome to open an empty `Profile 1`, and
+  agent-browser 0.31.2 forced a basic/mock keychain that cannot use Chrome's
+  Linux Secret Service state. The snapshot now normalizes only the managed copy
+  to `last_used: Default` and removes stale managed source-profile directories.
+  Linux launches the installed stable Chromium directly on the copy with
+  gnome-libsecret and an identity-bound mode-0600 PID file; normal Hermes browser
+  commands still attach over CDP. Default and Tyler have independent managed
+  copies/PIDs/CDP endpoints and can coexist. The user's live Chrome profile is
+  never written, driven, or closed.
 
 ## Verification
 
@@ -225,6 +241,21 @@ both.
   restart, both gateways reported current code, both DBs passed `quick_check`,
   and the Tyler watchdog timer was active with no auto-maintenance/SQLite error
   in the startup journal.
+- Real-profile verification: the existing 74-test real-profile suite passes,
+  including a red-green regression that copied `Local State` must select
+  `Default`; an expanded browser/connect/cleanup selection passes 145/145.
+  Live default and Tyler launches each resolved Chrome's current active source
+  as `Profile 1`, copied cookies/login data/preferences into a separate
+  owner-only `browser-profile/chrome`, normalized the managed last-used profile
+  to `Default`, and exposed a CDP endpoint whose `DevToolsActivePort` matched
+  that exact copy. Both process command lines used gnome-libsecret with neither
+  mock-keychain nor basic-store flags. After Chrome account reconciliation,
+  Google rendered the account control and no `Sign in` control in both copies;
+  both test tabs were returned to `about:blank`. The real desktop Chrome process
+  remained alive throughout, and the destructive `hermes browser close-profile`
+  command was never invoked. Ubuntu `libsecret-tools` and Xvfb were installed
+  for keyring diagnostics and headed-browser support; the production real-
+  profile path itself is direct headless Chrome plus libsecret.
 
 ## Update Workflow
 
@@ -272,6 +303,11 @@ push.
 - `browser.real_profile_autoclose` is intentionally false. The snapshot path may
   copy committed auth data from an open Chrome on POSIX, but Hermes never closes
   the user's browser or drives the live profile directly.
+- On Linux, do not route the consented profile copy back through an
+  agent-browser-managed launch: its basic/mock keychain flags produce a valid
+  CDP browser that is nevertheless signed out. Hermes owns the direct libsecret
+  process via `.hermes-browser.pid`; reuse/cleanup must verify that PID's exact
+  `--user-data-dir` binding before signalling it.
 - Bulk prune's current upstream `archived` filter is tri-state; `None` includes
   both archived and unarchived rows. The durable automatic-preservation flag is
   `pinned`, which prune excludes unless `include_pinned=true` is explicit.

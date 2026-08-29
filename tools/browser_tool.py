@@ -1535,21 +1535,171 @@ def _agent_browser_close_session(session_name: str) -> None:
         logger.debug("real-profile session close failed: %s", e)
 
 
+_REAL_PROFILE_DIRECT_PID = ".hermes-browser.pid"
+
+
+def _direct_profile_pid(data_dir: str) -> int | None:
+    """Return the identity-verified direct browser PID for *data_dir*."""
+    path = os.path.join(data_dir, _REAL_PROFILE_DIRECT_PID)
+    try:
+        pid = int(Path(path).read_text(encoding="utf-8").strip())
+        if pid <= 0:
+            return None
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+        binding = f"--user-data-dir={data_dir}".encode()
+        if binding not in cmdline or b"chrome" not in cmdline.lower():
+            return None
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, PermissionError):
+        return None
+
+
+def _direct_profile_cdp(data_dir: str) -> str | None:
+    """Return a ready CDP URL only for Hermes' identity-bound direct launch."""
+    if _direct_profile_pid(data_dir) is None:
+        return None
+    try:
+        port = Path(data_dir, "DevToolsActivePort").read_text(
+            encoding="utf-8"
+        ).splitlines()[0].strip()
+        cdp = f"http://127.0.0.1:{int(port)}"
+    except (OSError, ValueError, IndexError):
+        return None
+    return cdp if _cdp_http_ready(cdp) and _cdp_on_data_dir(cdp, data_dir) else None
+
+
+def _stop_direct_profile_browser(data_dir: str) -> bool:
+    """Stop only the Hermes browser whose PID is bound to *data_dir*."""
+    pid = _direct_profile_pid(data_dir)
+    if pid is not None:
+        try:
+            pgid = os.getpgid(pid)
+            if pgid == pid:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if not _pid_exists(pid):
+                break
+            time.sleep(0.1)
+        if _pid_exists(pid):
+            try:
+                pgid = os.getpgid(pid)
+                if pgid == pid:
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            force_deadline = time.monotonic() + 2.0
+            while time.monotonic() < force_deadline and _pid_exists(pid):
+                time.sleep(0.05)
+        if _pid_exists(pid):
+            return False
+    for name in (_REAL_PROFILE_DIRECT_PID, "DevToolsActivePort"):
+        try:
+            os.unlink(os.path.join(data_dir, name))
+        except OSError:
+            pass
+    return True
+
+
+def _launch_linux_real_profile_browser(
+    browser: str, data_dir: str
+) -> tuple[str | None, str | None]:
+    """Launch the Linux profile copy without agent-browser's mock keychain.
+
+    agent-browser 0.31 adds ``--password-store=basic --use-mock-keychain`` to
+    every managed Chromium.  A real Chrome profile on Linux stores auth under
+    the Secret Service (``v11`` encryption), so that launch silently discards
+    the copied login cookies.  Launch Chrome directly with libsecret, then let
+    every normal browser command attach to its CDP endpoint.
+    """
+    from hermes_cli.browser_connect import chromium_executable
+
+    existing = _direct_profile_cdp(data_dir)
+    if existing:
+        return existing, None
+
+    if not _stop_direct_profile_browser(data_dir):
+        return None, "the previous managed profile browser could not be stopped"
+    executable = chromium_executable(browser)
+    if not executable:
+        return None, f"could not find the '{browser}' executable"
+
+    env = _build_browser_env()
+    runtime_dir = f"/run/user/{os.getuid()}"
+    env["XDG_RUNTIME_DIR"] = runtime_dir
+    env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={runtime_dir}/bus"
+    argv = [
+        executable,
+        "--remote-debugging-port=0",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--password-store=gnome-libsecret",
+        "--headless=new",
+        "--hide-scrollbars",
+        f"--user-data-dir={data_dir}",
+        "--window-size=1280,720",
+        "about:blank",
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+            start_new_session=True,
+        )
+        pid_path = Path(data_dir, _REAL_PROFILE_DIRECT_PID)
+        tmp_path = pid_path.with_suffix(".tmp")
+        tmp_path.write_text(str(proc.pid), encoding="utf-8")
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, pid_path)
+    except (OSError, ValueError) as exc:
+        return None, f"could not launch the real-profile browser: {exc}"
+
+    deadline = time.monotonic() + _get_open_command_timeout(first_open=True)
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            _stop_direct_profile_browser(data_dir)
+            return None, (
+                "the real-profile browser exited before exposing its "
+                "devtools endpoint"
+            )
+        cdp = _direct_profile_cdp(data_dir)
+        if cdp:
+            # Chrome's account reconciler promotes copied profile tokens into
+            # web-login cookies asynchronously just after startup.
+            time.sleep(2.0)
+            return cdp, None
+        time.sleep(0.1)
+
+    _stop_direct_profile_browser(data_dir)
+    return None, "the real-profile browser took too long to expose devtools"
+
+
 def _real_profile_cdp() -> tuple:
     """Resolve ``(cdp_url, error)`` for consented real-profile browsing.
 
     Snapshots the user's default-Chromium profile into a hermes-owned copy
-    (auth/login state only), then has agent-browser launch its packaged
-    Chromium on that copy and returns the HTTP CDP endpoint for the browser-use
-    harness to attach to. The copy is a non-default dir, so it sidesteps the
-    Chrome ≥136 default-profile remote-debugging block and never contends with
-    the user's running browser; agent-browser launches the packaged Chromium
-    with no mock-keychain switches, so keyring-encrypted cookies decrypt.
+    (auth/login state only) and returns the HTTP CDP endpoint for the browser
+    harness. On Linux, Hermes launches the user's Chromium binary directly
+    with libsecret because agent-browser's mock/basic keychain flags cannot
+    decrypt a real profile. Other platforms keep the agent-browser-managed
+    launch. The copy is a non-default dir, so it sidesteps Chrome ≥136's
+    default-profile remote-debugging block and never contends with the user's
+    running browser.
 
-    A single shared agent-browser session is reused across calls (its CDP URL
-    is cached and re-validated). Returns ``(None, message)`` fail-closed when
-    the default browser is non-Chromium or the snapshot/launch fails;
-    ``(None, None)`` when consent is off.
+    A live copy-browser is reused across calls (its CDP URL is cached and
+    re-validated). Returns ``(None, message)`` fail-closed when the default
+    browser is non-Chromium or the snapshot/launch fails; ``(None, None)`` when
+    consent is off.
     """
     if not _use_real_profile():
         # Consent is off. If a snapshot store from a previous consented run is
@@ -1558,6 +1708,12 @@ def _real_profile_cdp() -> tuple:
         # (one isdir check) and idempotent.
         try:
             from hermes_cli.browser_connect import cleanup_real_profile_snapshots
+
+            root = Path(get_hermes_home()) / "browser-profile"
+            if root.is_dir():
+                for child in root.iterdir():
+                    if child.is_dir():
+                        _stop_direct_profile_browser(str(child))
 
             cleanup_real_profile_snapshots()
         except Exception as e:
@@ -1623,8 +1779,22 @@ def _real_profile_cdp() -> tuple:
         # snapshot/overlay happens solely on the relaunch path below, when no
         # live browser owns the dir.
         copy_dir = real_profile_copy_dir(browser)
+        # Linux real-profile browsers are launched directly so Chrome can use
+        # the user's Secret Service instead of agent-browser's mock keychain.
+        # Reuse only an identity-bound direct PID; an older agent-browser-owned
+        # process on the same dir is intentionally not trusted as authenticated.
+        if sys.platform.startswith("linux"):
+            direct = _direct_profile_cdp(copy_dir)
+            if direct:
+                _real_profile_cdp_cache["cdp"] = direct
+                return direct, None
         existing = _agent_browser_get_cdp(_REAL_PROFILE_SESSION)
-        if existing and _cdp_http_ready(existing) and _cdp_on_data_dir(existing, copy_dir):
+        if (
+            not sys.platform.startswith("linux")
+            and existing
+            and _cdp_http_ready(existing)
+            and _cdp_on_data_dir(existing, copy_dir)
+        ):
             _real_profile_cdp_cache["cdp"] = existing
             return existing, None
         if existing:
@@ -1650,6 +1820,24 @@ def _real_profile_cdp() -> tuple:
                 )
             return None, f"browser.use_real_profile is on, but {err}"
         copy_dir = snap_dir
+
+        if sys.platform.startswith("linux"):
+            cdp, launch_error = _launch_linux_real_profile_browser(
+                browser, copy_dir
+            )
+            if not cdp:
+                return None, (
+                    "browser.use_real_profile is on, but "
+                    f"{launch_error or 'the Linux profile-copy launch failed'}"
+                )
+            _real_profile_cdp_cache["cdp"] = cdp
+            logger.info(
+                "real-profile browser ready for %s at %s (%s)",
+                browser,
+                cdp,
+                copy_dir,
+            )
+            return cdp, None
 
         # Launch agent-browser's packaged Chromium on the profile COPY. This is
         # the same launch path Hermes' built-in local browsing already uses,
