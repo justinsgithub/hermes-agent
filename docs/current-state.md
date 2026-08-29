@@ -1,19 +1,19 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-28T23:05:56-07:00_
+_Last updated: 2026-08-28T23:22:11-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
 - Branch: `justin/main`
-- Snapshot base commit: `e5b17790e6 Merge remote-tracking branch 'origin/main' into justin/main`
+- Snapshot base commit: `5220a6fe81 Merge remote-tracking branch 'origin/main' into justin/main`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
 - Working tree: `clean`
 - Recent commits:
-  - `e5b17790e6 Merge remote-tracking branch 'origin/main' into justin/main`
-  - `3d7552ef7f docs: record one-command Hermes update workflow`
-  - `24e54b55f5 fix(desktop): preserve streamed assistant text and unify atomic persistence (#95514)`
-  - `a7e7de6407 fix(desktop): make gateway file saves failure-atomic so a failed download never destroys an existing file`
-  - `6f689d0b05 test(cache): pin the prompt-cache scope isolation invariant for per-response session ids`
+  - `5220a6fe81 Merge remote-tracking branch 'origin/main' into justin/main`
+  - `ae637efe7d fix(update): preserve restarted gateway services`
+  - `10e93c6ab9 fix(skills): drop redundant identical-strings guard and its vacuous tests`
+  - `1ff8ec9a49 test(skills): cover the patch recovery loop end to end`
+  - `4f4e778db8 fix(skills): make skill_manage patch failures recoverable instead of a dead end`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -109,6 +109,16 @@ both.
   A final dogfood run merged seven additional upstream commits, repeated the
   restart/runtime/package/remote gates, and left `justin/main` containing
   current `origin/main` with no behind commits.
+- Fixed the pending-restart catch-up race exposed by the live update wrapper.
+  Hermes had restarted the two user-systemd gateways, then its manual-process
+  sweep killed those fresh replacement PIDs and returned during systemd's
+  five-second `Restart=always` gap. The host process scan also saw the John and
+  Amanda Docker gateways under UID 10000 and emitted misleading permission
+  warnings. Supplemental `/proc` discovery is now restricted to the invoking
+  UID, the catch-up sweep excludes every freshly supervised PID, and the wrapper
+  waits for bounded systemd recovery before performing one explicit restart and
+  final interpreter readback. `--repair-services` exposes that recovery gate
+  without fetching or changing source.
 
 ## Verification
 
@@ -158,6 +168,17 @@ both.
   The merged patch/update/browser/Hindsight/API/state focused suite passed
   322/322 tests. The updater's final parked-branch regression file then passed
   22/22 again against the exact final merge.
+- Restart-race verification: both new regressions failed before the fix and
+  passed after it; the expanded restart/process-discovery selection passed
+  48/48. A reversible live known-bad probe stopped
+  `hermes-gateway-tyler.service`, confirmed it inactive, and required
+  `hermes-local-update --repair-services` to restore it on a new PID using the
+  checkout's hardened interpreter. A second live run recreated
+  `fleet_restart_pending` while Git was already current, exercised the exact
+  catch-up branch, and completed with no permission warnings, both services
+  active on fresh PIDs, Python 3.11.16 / SQLite 3.53.4 / FTS5 ready, 196
+  compatible packages, zero commits behind upstream, and `fork/main` matching
+  `5220a6fe81`.
 
 ## Update Workflow
 
@@ -167,6 +188,7 @@ directly on the patched checkout:
 ```bash
 hermes-local-update --check  # fetch and report only
 hermes-local-update --plan   # show divergence and restart plan
+hermes-local-update --repair-services  # recover/verify gateways; no source update
 hermes-local-update          # back up, merge, install, restart, verify, push
 ```
 
@@ -190,6 +212,10 @@ push.
   snapshot remains the current database rollback point; optimize or separately
   snapshot the large DB before any future update that includes a state schema
   migration.
+- Hermes now reports that `hermes sessions optimize-storage` can reclaim about
+  2.6 GB from the 4.3 GB default session database's old search-index layout.
+  Before running that foreground rewrite, take and verify a current full-size
+  database snapshot because the routine 1 GB-capped update snapshot skips it.
 
 ## Blockers
 
@@ -217,4 +243,6 @@ push.
   upstream branch and is not the production checkout. Direct `hermes update`
   is no longer the operator workflow; use `hermes-local-update` so the branch,
   backup, runtime, service, and remote-readback guards all run.
+- Host-visible Docker gateways owned by another UID are separate runtimes and
+  must never be signalled by the local checkout's manual-process cleanup.
 - Aivex Portal is retired. Keep technical continuity here, never in Portal.
