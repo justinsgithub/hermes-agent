@@ -3125,6 +3125,7 @@ def _run_pending_fleet_restart() -> bool:
         pass
     try:
         from hermes_cli.gateway import (
+            _get_service_pids,
             find_gateway_pids,
             is_macos,
             is_windows,
@@ -3173,7 +3174,15 @@ def _run_pending_fleet_restart() -> bool:
             leftover = list(pids or [])
         if leftover:
             try:
-                kill_gateway_processes(all_profiles=True)
+                # The systemd/launchd restart above has already spawned fresh
+                # service processes.  Exclude those PIDs from the manual
+                # cleanup sweep or the catch-up path kills its own successful
+                # replacements and returns during the supervisor restart gap.
+                service_pids = _get_service_pids(all_profiles=True)
+                kill_gateway_processes(
+                    exclude_pids=service_pids,
+                    all_profiles=True,
+                )
                 _wait_for_gateway_exit(timeout=5.0, force_after=None)
             except Exception as exc:
                 logger.debug("Pending fleet restart: PID stop failed: %s", exc)

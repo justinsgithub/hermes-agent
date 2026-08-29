@@ -729,6 +729,26 @@ def _scan_gateway_pids(
     )
     current_profile_name_lc = current_profile_name.lower()
 
+    def _owned_by_current_user(pid: int) -> bool:
+        """Keep host scans inside the invoking user's process boundary.
+
+        A host with Docker containers can expose container gateway processes
+        through the host's ``/proc``.  Their argv still looks exactly like a
+        local ``hermes gateway run``, but signalling them from an ordinary
+        user both fails and risks crossing an unrelated runtime boundary.
+        Supervised system-scope gateways remain discoverable through
+        ``_get_service_pids``; this guard applies only to the supplemental
+        process-table sweep.
+        """
+        if not hasattr(os, "geteuid"):
+            return True
+        try:
+            return os.stat(f"/proc/{pid}").st_uid == os.geteuid()
+        except (FileNotFoundError, PermissionError, OSError):
+            # Preserve the historical best-effort scan on platforms where
+            # /proc ownership metadata is unavailable.
+            return True
+
     def _matches_current_profile(command: str) -> bool:
         command_lc = command.lower().replace("\\", "/")
         if current_profile_name:
@@ -841,6 +861,8 @@ def _scan_gateway_pids(
                             continue
                         pid = int(entry)
                         if pid == my_pid or pid in exclude_pids:
+                            continue
+                        if not _owned_by_current_user(pid):
                             continue
                         try:
                             with open(f"/proc/{pid}/cmdline", "rb") as _f:

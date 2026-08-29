@@ -22,7 +22,7 @@ _GATEWAY_CMD = "python -m hermes_cli.main gateway run"
 _OTHER_CMD = "python -m some_other_thing"
 
 
-def _fake_proc_dir(entries: dict):
+def _fake_proc_dir(entries: dict, *, uid_by_pid: dict[int, int] | None = None):
     """Return side_effects that simulate /proc: isdir → True, listdir → pids,
     open(cmdline) → null-delimited command bytes."""
     def _isdir(path):
@@ -45,7 +45,17 @@ def _fake_proc_dir(entries: dict):
             return m
         raise FileNotFoundError(path)
 
-    return _isdir, _listdir, _open
+    real_stat = os.stat
+
+    def _stat(path, *args, **kwargs):
+        path_str = str(path)
+        if "/proc/" not in path_str:
+            return real_stat(path, *args, **kwargs)
+        pid = int(path_str.split("/proc/")[1].split("/")[0])
+        uid = (uid_by_pid or {}).get(pid, os.geteuid())
+        return MagicMock(st_uid=uid)
+
+    return _isdir, _listdir, _open, _stat
 
 
 # ---------------------------------------------------------------------------
@@ -70,11 +80,12 @@ class TestProcFallback:
             12345: _GATEWAY_CMD,
             99999: _OTHER_CMD,
         }
-        _isdir, _listdir, _open = _fake_proc_dir(entries)
+        _isdir, _listdir, _open, _stat = _fake_proc_dir(entries)
 
         with (
             patch("os.path.isdir", side_effect=_isdir),
             patch("os.listdir", side_effect=_listdir),
+            patch("os.stat", side_effect=_stat),
             patch("builtins.open", side_effect=_open),
             patch("hermes_cli.gateway._get_ancestor_pids", return_value=set()),
             patch("subprocess.run") as mock_ps,
@@ -84,6 +95,29 @@ class TestProcFallback:
         assert 12345 in pids
         assert 99999 not in pids
         mock_ps.assert_not_called()  # ps must NOT be called when /proc worked
+
+    def test_ignores_gateway_owned_by_another_uid(self):
+        entries = {
+            12345: _GATEWAY_CMD,
+            23456: _GATEWAY_CMD,
+        }
+        _isdir, _listdir, _open, _stat = _fake_proc_dir(
+            entries,
+            uid_by_pid={12345: os.geteuid(), 23456: os.geteuid() + 1},
+        )
+
+        with (
+            patch("os.path.isdir", side_effect=_isdir),
+            patch("os.listdir", side_effect=_listdir),
+            patch("os.stat", side_effect=_stat),
+            patch("builtins.open", side_effect=_open),
+            patch("hermes_cli.gateway._get_ancestor_pids", return_value=set()),
+            patch("subprocess.run") as mock_ps,
+        ):
+            pids = gateway_mod._scan_gateway_pids(set(), all_profiles=True)
+
+        assert pids == [12345]
+        mock_ps.assert_not_called()
 
 
 
@@ -103,6 +137,7 @@ class TestProcFallback:
         with (
             patch("os.path.isdir", side_effect=_isdir),
             patch("os.listdir", side_effect=_listdir),
+            patch("os.stat", return_value=MagicMock(st_uid=os.geteuid())),
             patch("builtins.open", side_effect=_open),
             patch("hermes_cli.gateway._get_ancestor_pids", return_value=set()),
             patch("subprocess.run") as mock_ps,

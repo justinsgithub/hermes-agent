@@ -14,14 +14,17 @@ target_branch="${HERMES_TARGET_BRANCH:-main}"
 backup_remote="${HERMES_BACKUP_REMOTE:-fork}"
 backup_ref="${HERMES_BACKUP_REF:-main}"
 mode="update"
+service_settle_seconds="${HERMES_SERVICE_SETTLE_SECONDS:-15}"
+service_recovery_seconds="${HERMES_SERVICE_RECOVERY_SECONDS:-30}"
 
 usage() {
     printf '%s\n' \
-        'Usage: hermes-local-update [--check|--plan]' \
+        'Usage: hermes-local-update [--check|--plan|--repair-services]' \
         '' \
         '  no argument  Back up, update, verify, restart, and push.' \
         '  --check      Fetch and report upstream divergence only.' \
-        '  --plan       Show divergence and Hermes restart plan only.'
+        '  --plan       Show divergence and Hermes restart plan only.' \
+        '  --repair-services  Recover and verify the two local gateways only.'
 }
 
 log() {
@@ -37,6 +40,7 @@ case "${1:-}" in
     '') ;;
     --check) mode="check" ;;
     --plan) mode="plan" ;;
+    --repair-services) mode="repair-services" ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
 esac
@@ -62,9 +66,54 @@ python_bin="$repo/venv/bin/python"
 test -x "$hermes_bin" || die "Hermes CLI is not executable: $hermes_bin"
 test -x "$python_bin" || die "Hermes Python is not executable: $python_bin"
 
+wait_for_service_runtime() {
+    local service="$1"
+    local timeout_seconds="$2"
+    local deadline=$((SECONDS + timeout_seconds))
+    local pid process_exe
+
+    while (( SECONDS <= deadline )); do
+        if systemctl --user is-active --quiet "$service"; then
+            pid="$(systemctl --user show "$service" -p MainPID --value)"
+            if test -n "$pid" && test "$pid" != "0" && test -r "/proc/$pid/exe"; then
+                process_exe="$(readlink -f "/proc/$pid/exe")"
+                if test "$process_exe" = "$(readlink -f "$python_bin")"; then
+                    return 0
+                fi
+            fi
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+ensure_gateway_services() {
+    local service
+    for service in hermes-gateway.service hermes-gateway-tyler.service; do
+        # systemd Restart=always intentionally creates a brief inactive gap.
+        # Let that bounded self-recovery settle before taking over.
+        if ! wait_for_service_runtime "$service" "$service_settle_seconds"; then
+            log "$service did not settle; recovering it through user systemd"
+            systemctl --user reset-failed "$service" >/dev/null 2>&1 || true
+            systemctl --user restart "$service" || die \
+                "could not restart $service"
+            wait_for_service_runtime "$service" "$service_recovery_seconds" || die \
+                "$service did not become healthy on the live venv after recovery"
+        fi
+        pid="$(systemctl --user show "$service" -p MainPID --value)"
+        log "$service active on PID $pid"
+    done
+}
+
 mkdir -p "$repo/.hermes-runtime"
 exec 9>"$repo/.hermes-runtime/local-update.lock"
 flock -n 9 || die "another local Hermes update is already running"
+
+if test "$mode" = "repair-services"; then
+    ensure_gateway_services
+    log "gateway service repair and verification complete"
+    exit 0
+fi
 
 current_branch="$(git branch --show-current)"
 test "$current_branch" = "$patch_branch" || die \
@@ -151,15 +200,7 @@ fi
 test -n "$uv_bin" || die "uv is unavailable for the dependency compatibility check"
 "$uv_bin" pip check --python "$repo/venv/bin/python"
 
-for service in hermes-gateway.service hermes-gateway-tyler.service; do
-    systemctl --user is-active --quiet "$service" || die "$service is not active"
-    pid="$(systemctl --user show "$service" -p MainPID --value)"
-    test "$pid" != "0" || die "$service has no main process"
-    process_exe="$(readlink -f "/proc/$pid/exe")"
-    live_exe="$(readlink -f "$repo/venv/bin/python")"
-    test "$process_exe" = "$live_exe" || die \
-        "$service still runs $process_exe instead of $live_exe"
-done
+ensure_gateway_services
 
 log "pushing the verified patch stack to $backup_remote/$backup_ref"
 git push "$backup_remote" "HEAD:$backup_ref"

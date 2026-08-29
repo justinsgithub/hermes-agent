@@ -87,6 +87,7 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         hermes_main, "_stash_local_changes_if_needed", lambda *a, **k: None
     )
     monkeypatch.setattr(hermes_main, "_clear_bytecode_cache", lambda *a, **k: 0)
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
     monkeypatch.setattr(
         hermes_main, "_record_bytecode_fingerprint", lambda *a, **k: None
     )
@@ -111,7 +112,44 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     import hermes_cli.gateway as hermes_gateway
 
     monkeypatch.setattr(
-        hermes_gateway, "find_gateway_pids", lambda all_profiles=False: []
+        hermes_gateway,
+        "find_gateway_pids",
+        lambda exclude_pids=None, all_profiles=False: [],
+    )
+    monkeypatch.setattr(
+        hermes_gateway, "_get_service_pids", lambda all_profiles=False: set()
+    )
+    monkeypatch.setattr(
+        hermes_gateway,
+        "kill_gateway_processes",
+        lambda force=False, exclude_pids=None, all_profiles=False: 0,
+    )
+    # hermes_cli.main re-exports update helpers at import time; patch those
+    # aliases too so this mocked update can never inspect or signal the live
+    # developer gateway fleet.
+    monkeypatch.setattr(
+        hermes_main,
+        "find_gateway_pids",
+        lambda exclude_pids=None, all_profiles=False: [],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "_get_service_pids",
+        lambda all_profiles=False: set(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "kill_gateway_processes",
+        lambda force=False, exclude_pids=None, all_profiles=False: 0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        hermes_main,
+        "find_profile_gateway_processes",
+        lambda *args, **kwargs: [],
+        raising=False,
     )
     monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(
@@ -272,6 +310,47 @@ def test_run_pending_restart_true_when_no_gateways(monkeypatch, capsys):
 
     assert update_cmd._run_pending_fleet_restart() is True
     assert "nothing to restart" in capsys.readouterr().out
+
+
+def test_pending_restart_manual_sweep_excludes_restarted_service_pids(
+    monkeypatch,
+):
+    """Catch-up must not kill the systemd processes it just restarted."""
+    from hermes_cli import gateway as hermes_gateway
+
+    scans = iter(([11, 12], [101, 102, 999]))
+    killed = []
+
+    monkeypatch.setattr(hermes_main, "_purge_stale_hermes_modules", lambda: None)
+    monkeypatch.setattr(
+        hermes_gateway,
+        "find_gateway_pids",
+        lambda **_kwargs: list(next(scans)),
+    )
+    monkeypatch.setattr(hermes_gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(hermes_gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(hermes_gateway, "is_windows", lambda: False)
+    monkeypatch.setattr(
+        hermes_gateway,
+        "_get_service_pids",
+        lambda all_profiles=False: {101, 102},
+    )
+    monkeypatch.setattr(
+        hermes_gateway,
+        "kill_gateway_processes",
+        lambda **kwargs: killed.append(kwargs) or 1,
+    )
+    monkeypatch.setattr(hermes_gateway, "_wait_for_gateway_exit", lambda **_k: True)
+    monkeypatch.setattr(
+        update_cmd,
+        "_restart_systemd_gateway_units_best_effort",
+        lambda failed: None,
+    )
+
+    assert update_cmd._run_pending_fleet_restart() is True
+    assert killed == [
+        {"exclude_pids": {101, 102}, "all_profiles": True}
+    ]
 
 
 # ---------------------------------------------------------------------------
