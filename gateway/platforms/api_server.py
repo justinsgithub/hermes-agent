@@ -7727,6 +7727,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+        # A caller-owned durable session is the short-term transcript source
+        # when no explicit history/chained response was supplied. This keeps
+        # prior tool calls and tool results in the next /v1/runs turn instead
+        # of preserving only the session label.
+        if not conversation_history and session_id:
+            conversation_history = await self._conversation_history_for_session(
+                session_id
+            )
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -7820,10 +7828,10 @@ class APIServerAdapter(BasePlatformAdapter):
                         gateway_session_key=gateway_session_key,
                         requested_model=agent_overrides.get("requested_model"),
                         requested_provider=agent_overrides.get("requested_provider"),
-                            model_options=agent_overrides.get("model_options"),
-                            route=route,
-                            skip_memory=skip_memory,
-                        )
+                        model_options=agent_overrides.get("model_options"),
+                        route=route,
+                        skip_memory=skip_memory,
+                    )
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
@@ -7899,6 +7907,14 @@ class APIServerAdapter(BasePlatformAdapter):
                             # ownership so stop/cancel can reap only the
                             # background processes this run created (#76115).
                             _publish_turn_process_ownership(agent, effective_task_id)
+                            # Continue the server-owned SessionDB transcript
+                            # exactly like _run_agent() does for Responses and
+                            # session chat. Without this, /v1/runs echoes a
+                            # stable session_id while silently starting each
+                            # run with no prior tool calls or tool results.
+                            session_db = getattr(agent, "_session_db", None)
+                            if session_db is not None and session_id:
+                                session_db.reopen_session(session_id)
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,

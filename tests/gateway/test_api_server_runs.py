@@ -12,7 +12,7 @@ Covers:
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -128,6 +128,54 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_existing_session_reopens_before_conversation_run(self, adapter):
+        app = _create_runs_app(adapter)
+        call_order = []
+        stored_history = [
+            {"role": "assistant", "content": "prior answer"},
+            {"role": "tool", "content": "prior tool result", "tool_call_id": "call-1"},
+        ]
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent") as mock_create,
+                patch.object(
+                    adapter,
+                    "_conversation_history_for_session",
+                    new=AsyncMock(return_value=stored_history),
+                ) as mock_history,
+            ):
+                mock_agent = MagicMock()
+                mock_agent._session_db.reopen_session.side_effect = (
+                    lambda session_id: call_order.append(("reopen", session_id))
+                )
+
+                def _run_conversation(**_kwargs):
+                    call_order.append(("run", None))
+                    return {"final_response": "continued"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "continue", "session_id": "durable-session"},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+                for _ in range(40):
+                    status = await (await cli.get(f"/v1/runs/{run_id}")).json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert call_order == [("reopen", "durable-session"), ("run", None)]
+        mock_history.assert_awaited_once_with("durable-session")
+        assert mock_agent.run_conversation.call_args.kwargs["conversation_history"] == stored_history
+
     @pytest.mark.asyncio
     async def test_memory_bypass_is_forwarded_to_agent_construction(self, adapter):
         app = _create_runs_app(adapter)

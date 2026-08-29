@@ -1,19 +1,22 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-29T08:25:02-07:00_
+_Last updated: 2026-08-29T09:09:40-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
-- Branch: `justin/main`
-- Snapshot base commit: `cae3776264 fix(api): honor memory bypass on durable runs`
+- Branch: `codex/runs-session-continuity`
+- Snapshot base commit: `a63343afc5 docs: refresh Hermes durable-run state`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
-- Working tree: `clean`
+- Working tree: `dirty`
+- Status:
+  - ` M gateway/platforms/api_server.py`
+  - ` M tests/gateway/test_api_server_runs.py`
 - Recent commits:
+  - `a63343afc5 docs: refresh Hermes durable-run state`
   - `cae3776264 fix(api): honor memory bypass on durable runs`
   - `440c81d887 fix(browser): preserve Linux real-profile logins`
   - `540425c2d9 docs: record Hermes auto-prune enablement`
   - `fb2b7bd807 docs: record Hermes session-store compaction`
-  - `ceeffb7796 Merge remote-tracking branch 'origin/main' into justin/main`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -68,6 +71,11 @@ both.
 
 ## Recent Changes
 
+- Fixed durable `/v1/runs` session continuity. A caller-provided `session_id`
+  now loads the existing SessionDB transcript when explicit request history is
+  absent, including prior tool calls and tool results, and reopens that session
+  before the new conversation turn. Previously the API echoed a stable session
+  ID while each run silently started without its prior tool-bearing context.
 - Extended the authenticated native `/v1/runs` endpoint to honor the same
   `X-Hermes-Memory: enabled|bypass` contract as `/v1/responses`. Durable runs
   now pass `skip_memory=True` into agent construction for bypassed turns, so
@@ -161,6 +169,10 @@ both.
 
 ## Verification
 
+- `/v1/runs` continuity regression: the full endpoint suite passed 28/28 and
+  Ruff/diff checks passed. A live two-turn, memory-bypassed canary used the UTC
+  time tool in turn one, returned only `READY`, then recovered the exact prior
+  tool result in turn two without another tool call and ended `CONTINUITY_OK`.
 - `/v1/runs` memory-control regression: the full
   `tests/gateway/test_api_server_runs.py` suite passed 27/27; focused bypass,
   invalid-value, and ordinary-start coverage passed 3/3; Ruff and
