@@ -1,22 +1,19 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-29T09:09:40-07:00_
+_Last updated: 2026-08-29T09:09:55-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
-- Branch: `codex/runs-session-continuity`
-- Snapshot base commit: `a63343afc5 docs: refresh Hermes durable-run state`
+- Branch: `justin/main`
+- Snapshot base commit: `03eb14087c fix(api): preserve tool history across durable runs`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
-- Working tree: `dirty`
-- Status:
-  - ` M gateway/platforms/api_server.py`
-  - ` M tests/gateway/test_api_server_runs.py`
+- Working tree: `clean`
 - Recent commits:
+  - `03eb14087c fix(api): preserve tool history across durable runs`
   - `a63343afc5 docs: refresh Hermes durable-run state`
   - `cae3776264 fix(api): honor memory bypass on durable runs`
   - `440c81d887 fix(browser): preserve Linux real-profile logins`
   - `540425c2d9 docs: record Hermes auto-prune enablement`
-  - `fb2b7bd807 docs: record Hermes session-store compaction`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
