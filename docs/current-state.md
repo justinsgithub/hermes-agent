@@ -1,19 +1,19 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-29T00:00:03-07:00_
+_Last updated: 2026-08-29T00:10:05-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
 - Branch: `justin/main`
-- Snapshot base commit: `ceeffb7796 Merge remote-tracking branch 'origin/main' into justin/main`
+- Snapshot base commit: `fb2b7bd807 docs: record Hermes session-store compaction`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
 - Working tree: `clean`
 - Recent commits:
+  - `fb2b7bd807 docs: record Hermes session-store compaction`
   - `ceeffb7796 Merge remote-tracking branch 'origin/main' into justin/main`
   - `1d8946b40b fix(prompt-caching): tool-using sessions no longer 400 behind LiteLLM Anthropic proxies (#89886)`
   - `2f59693295 docs: record updater restart-race recovery`
   - `5220a6fe81 Merge remote-tracking branch 'origin/main' into justin/main`
-  - `ae637efe7d fix(update): preserve restarted gateway services`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -129,6 +129,17 @@ both.
   360,292,352 to 56,864,768 bytes. Both public CLI checks now report the search
   index is already compact. The two gateways and watchdog timer were restored
   after verification.
+- Enabled preservation-first automatic session pruning for both profiles with
+  the existing 90-day inactivity window, 24-hour maintenance interval, and
+  post-prune VACUUM policy. Fresh uncapped rollback snapshots were taken after
+  FTS compaction and before deletion. The read-only assessment found exactly
+  four eligible default sessions (all ended, unpinned, unarchived, 112–125 days
+  inactive, and carrying zero messages) and zero Tyler candidates; 2,123 old
+  but still-open default sessions were structurally ineligible. The first
+  offline sweep removed exactly those four empty rows (11,954 → 11,950) and
+  nothing from Tyler (9,795 unchanged), then both configs were set to
+  `sessions.auto_prune: true`. Pinned sessions remain excluded and open sessions
+  remain non-prunable.
 
 ## Verification
 
@@ -202,6 +213,18 @@ both.
   0700/0600, live DBs are 0600, Hermes doctor reports zero freelist pages and
   zero-byte WALs, and both live gateway processes load Python 3.11.16 with the
   private SQLite 3.53.4 library (`wal_reset_vulnerable=false`).
+- Auto-prune verification: post-compaction/pre-prune snapshots
+  `20260829-070650-pre-auto-prune` (default) and
+  `20260829-070754-pre-auto-prune` (Tyler) have complete manifests, zero
+  failed/oversized files, owner-only modes, source-matching DB sizes, and
+  `PRAGMA quick_check=ok`. The first sweep's actual deletion counts matched the
+  read-only assessment exactly; pinned counts were unchanged; both stores now
+  report zero 90-day candidates and durable `last_auto_prune` timestamps.
+  `last_vacuum` records the immediately preceding verified FTS-compaction
+  VACUUM, avoiding a redundant 1.8 GiB rewrite for four empty rows. After
+  restart, both gateways reported current code, both DBs passed `quick_check`,
+  and the Tyler watchdog timer was active with no auto-maintenance/SQLite error
+  in the startup journal.
 
 ## Update Workflow
 
@@ -234,9 +257,9 @@ push.
   soak. The compacted default `state.db` is still about 1.8 GiB and therefore
   remains above the built-in updater's intentional 1 GiB quick-snapshot cap;
   take another uncapped/manual snapshot before any future state-schema rewrite.
-- Hermes doctor now recommends `sessions.auto_prune` for the default store's
-  11,954 sessions. It remains disabled because enabling deletion is a separate
-  retention-policy decision; storage compaction did not delete conversations.
+- Auto-prune is enabled for both profiles. Retain the verified pre-prune
+  snapshots through the initial 90-day-policy soak; the daily sweep is expected
+  to no-op until another ended, unpinned session crosses the inactivity cutoff.
 
 ## Blockers
 
@@ -269,4 +292,9 @@ push.
 - A stable Tyler maintenance stop also requires temporarily stopping
   `local-hermes-watchdog.timer` and `local-hermes-watchdog.service`; otherwise
   the watchdog correctly relaunches the gateway while its database is offline.
+- `sessions.auto_prune` is permanent deletion, not archive rotation: it deletes
+  only ended sessions inactive for 90 days, includes old archived rows, excludes
+  pinned rows, and can never select open sessions. The separate
+  `hermes-session-maintenance` archive/receipt job is not its prerequisite or
+  rollback mechanism; use the verified uncapped snapshots for rollback.
 - Aivex Portal is retired. Keep technical continuity here, never in Portal.
