@@ -1,19 +1,19 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-28T07:21:51-07:00_
+_Last updated: 2026-08-28T23:03:15-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
-- Branch: `main`
-- Snapshot base commit: `2e6d1c686b docs: record Hermes upstream and browser cutover`
+- Branch: `justin/main`
+- Snapshot base commit: `dc5ee6161a fix(update): bind user systemd bus for verification`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
 - Working tree: `clean`
 - Recent commits:
-  - `2e6d1c686b docs: record Hermes upstream and browser cutover`
-  - `1a8188bbfc fix(browser): bound real-profile auth backup waits`
-  - `7acd92d20f chore(local): baseline live Hermes runtime fixes`
-  - `c32333dfae feat(memory): harden Hindsight retention and recall`
-  - `2b26aa6dd8 docs: record Hermes memory bypass state`
+  - `dc5ee6161a fix(update): bind user systemd bus for verification`
+  - `7c3a02441f Merge remote-tracking branch 'origin/main' into justin/main`
+  - `d7c0fb9d66 fmt(js): `npm run fix` on merge (#97706)`
+  - `178c23fb27 fix(desktop): open HUD links in the system browser`
+  - `240790af60 fix(desktop): let HUD prompts take clicks on solid X11`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -31,11 +31,10 @@ _Last updated: 2026-08-28T07:21:51-07:00_
   - `apps/desktop/build/native-deps/node-pty` `test`: `cross-env NODE_ENV=test mocha -R spec --exit lib/*.test.js`
   - `apps/desktop` `build`: `node scripts/assert-root-install.mjs && node scripts/write-build-stamp.mjs && vite build && node scripts/bundle-electron-main.mjs && node scripts/stage-native-deps.mjs`
   - `apps/desktop` `builder`: `cross-env NODE_OPTIONS=--max-old-space-size=16384 node scripts/run-electron-builder.mjs`
-  - `apps/desktop` `check`: `npm run check:lint && npm run test:ui && npm run test:desktop:platforms && npm run test:desktop:all && npm run check:test:plugins`
+  - `apps/desktop` `check`: `npm run check:lint && npm run test:ui && npm run test:desktop:platforms && npm run test:desktop:all`
   - `apps/desktop` `check:lint`: `npm run typecheck && npm run lint`
   - `apps/desktop` `check:test:desktop:all`: `npm run test:desktop:all`
   - `apps/desktop` `check:test:desktop:platforms`: `npm run test:desktop:platforms`
-  - `apps/desktop` `check:test:plugins`: `node --test src/plugins/*/tests/*.test.mjs`
   - `apps/desktop` `check:test:ui`: `npm run test:ui`
   - `apps/desktop` `dev`: `concurrently -k "npm:dev:renderer" "npm:dev:electron"`
   - `apps/desktop` `dev:electron`: `tsc --build tsconfig.electron.json && wait-on http://127.0.0.1:5174 && node scripts/bundle-electron-main.mjs --dev && cross-env XCURSOR_SIZE=24 HERMES_DESKTOP_DEV_SERVER=http://127.0.0.1:5174 electron .`
@@ -55,15 +54,17 @@ _Last updated: 2026-08-28T07:21:51-07:00_
   - `apps/desktop` `test:desktop:all`: `node scripts/test-desktop.mjs all`
   - `apps/desktop` `test:desktop:dmg`: `node scripts/test-desktop.mjs dmg`
   - `apps/desktop` `test:desktop:existing`: `node scripts/test-desktop.mjs existing`
+  - `apps/desktop` `test:desktop:fresh`: `node scripts/test-desktop.mjs fresh`
 <!-- REPO-STATUS:END -->
 
 ## Direction
 
-Hermes is the live local agent gateway on `justinsdesktop`. Local `main` tracks
-official `NousResearch/hermes-agent` upstream and carries a small reviewed patch
-stack; `fork` is the pushable backup for those patches. Real-profile browsing is
-consent-enabled for the default and Tyler profiles, and Firecrawl is the explicit
-web-extraction backend for both.
+Hermes is the live local agent gateway on `justinsdesktop`. Local `main` is the
+clean official `NousResearch/hermes-agent` branch; `justin/main` is the checked-
+out production branch carrying the reviewed local patch stack; `fork/main` is
+its pushable backup. Real-profile browsing is consent-enabled for the default
+and Tyler profiles, and Firecrawl is the explicit web-extraction backend for
+both.
 
 ## Recent Changes
 
@@ -91,6 +92,20 @@ web-extraction backend for both.
   with `--all` so Hermes retains FTS5/FTS4, RTREE, GEOPOLY, SESSION, DBPAGE,
   DBSTAT, CARRAY, and JSON support. The previous venv is parked beside `venv`
   as `venv.stale.runtime-1787926352-2873696-b367df54` for rollback.
+- Added `scripts/hermes-local-update.sh` and the
+  `~/.local/bin/hermes-local-update` launcher. The wrapper requires a clean
+  `justin/main`, validates the official origin and `update_in_place`/quick-
+  backup config, pre-pushes the patch stack, delegates backup/config/dependency/
+  UI/restart work to Hermes's built-in updater, then verifies upstream ancestry,
+  the safe SQLite+FTS5 runtime, package compatibility, both live service PIDs,
+  and the final fork readback. Local `main` now tracks `origin/main` without
+  patches, so the built-in updater can never mistake the patch stack for an
+  upstream force-push on a same-named branch.
+- The first real wrapper run merged 187 upstream commits into `justin/main`,
+  refreshed Python/lazy dependencies and Node workspaces, rebuilt the web UI,
+  restarted both gateway profiles, and reported both fleet members on the new
+  merge commit. A second run with no pending upstream changes completed as an
+  idempotent no-op and still ran every wrapper verification/readback gate.
 
 ## Verification
 
@@ -109,8 +124,8 @@ web-extraction backend for both.
   a real extract of `https://example.com` returned `Example Domain` with 167
   Markdown characters.
 - Live runtime proof: both `hermes-gateway.service` and
-  `hermes-gateway-tyler.service` are active/running with `NRestarts=0` on the
-  reconciled editable checkout.
+  `hermes-gateway-tyler.service` are active/running on the reconciled editable
+  `justin/main` checkout.
 - Runtime source verification: Python 3.11.16 tarball SHA-256
   `91bcdebfdde239a003ae93738a7fce0f9230fee5c4bc2b86f6e6e8c6f98aabe8`;
   SQLite 3.53.4 autoconf tarball SHA3-256
@@ -130,18 +145,47 @@ web-extraction backend for both.
   state.db readable, and both FTS tables. Both gateway processes load the
   private Python and `libsqlite3.so.3.53.4`, with no WAL-reset or FTS5 warning
   in the final startup window.
+- Updater verification: `bash -n` passed; a reversible wrong-branch probe
+  exited 1 with the intended fail-closed error; `--check` and `--plan` reported
+  the exact branch/divergence/service inventory; the real update preserved all
+  local commits and advanced to upstream; a second full run passed with the
+  D-Bus environment deliberately removed; Python 3.11.16 / SQLite 3.53.4 /
+  FTS5 passed, `uv pip check` passed for 196 packages, both systemd services
+  matched the live venv interpreter, and `fork/main` read back equal to HEAD.
+  The merged patch/update/browser/Hindsight/API/state focused suite passed
+  322/322 tests.
+
+## Update Workflow
+
+Use the installed one-command wrapper rather than running `hermes update`
+directly on the patched checkout:
+
+```bash
+hermes-local-update --check  # fetch and report only
+hermes-local-update --plan   # show divergence and restart plan
+hermes-local-update          # back up, merge, install, restart, verify, push
+```
+
+The update command fails closed if the branch is not `justin/main`, the worktree
+is dirty, the origin/backup remotes are wrong, the required update config has
+drifted, the merge conflicts, SQLite becomes vulnerable or loses FTS5, package
+compatibility fails, either gateway is inactive/stale, or the fork readback does
+not match local HEAD. It never uses `git reset --hard` or an unconditional force
+push.
 
 ## Next Work
 
-- Official upstream advanced by 88 commits during the runtime repair. Reconcile
-  the six carried commits onto current `origin/main` separately; none of those
-  88 commits changes the SQLite/runtime repair path.
 - Retain the parked vulnerable venv and the two verified state snapshots until
   the fixed runtime has completed the desired soak window. They are rollback
   assets, not active code.
 - The pre-update incidental `package-lock.json` delta is preserved in stash
   `d2e1baab560ae481088b9abc4fa77f12aa545aba`; the old untracked generated
   `build/` directory remains excluded from source history.
+- The built-in quick pre-update snapshot skips the 4.3 GB default `state.db`
+  because its quick-snapshot cap is 1 GB. The verified full-size SQLite cutover
+  snapshot remains the current database rollback point; optimize or separately
+  snapshot the large DB before any future update that includes a state schema
+  migration.
 
 ## Blockers
 
@@ -165,4 +209,8 @@ web-extraction backend for both.
   points at that interpreter. After any future runtime rebuild, rerun
   `hermes doctor` and require SQLite 3.51.3+ (or fixed backports 3.50.7/3.44.6)
   plus FTS5 before restarting the gateways.
+- Keep daily work on `justin/main`. Local `main` is intentionally the clean
+  upstream branch and is not the production checkout. Direct `hermes update`
+  is no longer the operator workflow; use `hermes-local-update` so the branch,
+  backup, runtime, service, and remote-readback guards all run.
 - Aivex Portal is retired. Keep technical continuity here, never in Portal.
