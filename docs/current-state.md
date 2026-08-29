@@ -1,19 +1,19 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-28T23:03:15-07:00_
+_Last updated: 2026-08-28T23:05:56-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
 - Branch: `justin/main`
-- Snapshot base commit: `dc5ee6161a fix(update): bind user systemd bus for verification`
+- Snapshot base commit: `e5b17790e6 Merge remote-tracking branch 'origin/main' into justin/main`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
 - Working tree: `clean`
 - Recent commits:
-  - `dc5ee6161a fix(update): bind user systemd bus for verification`
-  - `7c3a02441f Merge remote-tracking branch 'origin/main' into justin/main`
-  - `d7c0fb9d66 fmt(js): `npm run fix` on merge (#97706)`
-  - `178c23fb27 fix(desktop): open HUD links in the system browser`
-  - `240790af60 fix(desktop): let HUD prompts take clicks on solid X11`
+  - `e5b17790e6 Merge remote-tracking branch 'origin/main' into justin/main`
+  - `3d7552ef7f docs: record one-command Hermes update workflow`
+  - `24e54b55f5 fix(desktop): preserve streamed assistant text and unify atomic persistence (#95514)`
+  - `a7e7de6407 fix(desktop): make gateway file saves failure-atomic so a failed download never destroys an existing file`
+  - `6f689d0b05 test(cache): pin the prompt-cache scope isolation invariant for per-response session ids`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -106,6 +106,9 @@ both.
   restarted both gateway profiles, and reported both fleet members on the new
   merge commit. A second run with no pending upstream changes completed as an
   idempotent no-op and still ran every wrapper verification/readback gate.
+  A final dogfood run merged seven additional upstream commits, repeated the
+  restart/runtime/package/remote gates, and left `justin/main` containing
+  current `origin/main` with no behind commits.
 
 ## Verification
 
@@ -153,7 +156,8 @@ both.
   FTS5 passed, `uv pip check` passed for 196 packages, both systemd services
   matched the live venv interpreter, and `fork/main` read back equal to HEAD.
   The merged patch/update/browser/Hindsight/API/state focused suite passed
-  322/322 tests.
+  322/322 tests. The updater's final parked-branch regression file then passed
+  22/22 again against the exact final merge.
 
 ## Update Workflow
 
