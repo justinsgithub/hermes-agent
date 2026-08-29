@@ -1,22 +1,19 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-29T08:24:43-07:00_
+_Last updated: 2026-08-29T08:25:02-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
-- Branch: `codex/runs-memory-control`
-- Snapshot base commit: `440c81d887 fix(browser): preserve Linux real-profile logins`
+- Branch: `justin/main`
+- Snapshot base commit: `cae3776264 fix(api): honor memory bypass on durable runs`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
-- Working tree: `dirty`
-- Status:
-  - ` M gateway/platforms/api_server.py`
-  - ` M tests/gateway/test_api_server_runs.py`
+- Working tree: `clean`
 - Recent commits:
+  - `cae3776264 fix(api): honor memory bypass on durable runs`
   - `440c81d887 fix(browser): preserve Linux real-profile logins`
   - `540425c2d9 docs: record Hermes auto-prune enablement`
   - `fb2b7bd807 docs: record Hermes session-store compaction`
   - `ceeffb7796 Merge remote-tracking branch 'origin/main' into justin/main`
-  - `1d8946b40b fix(prompt-caching): tool-using sessions no longer 400 behind LiteLLM Anthropic proxies (#89886)`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
