@@ -3,8 +3,9 @@
 #
 # This is intentionally a thin guard around Hermes's own updater. Hermes owns
 # backups, config migration, dependency synchronization, runtime repair, and
-# fleet restart. This wrapper makes the branch/remote contract explicit and
-# verifies the live result before pushing the updated patch stack.
+# fleet restart. This wrapper makes the branch/remote contract explicit,
+# preserves local work outside the clean update window, and verifies the live
+# result before pushing the updated patch stack.
 
 set -euo pipefail
 
@@ -16,6 +17,9 @@ backup_ref="${HERMES_BACKUP_REF:-main}"
 mode="update"
 service_settle_seconds="${HERMES_SERVICE_SETTLE_SECONDS:-15}"
 service_recovery_seconds="${HERMES_SERVICE_RECOVERY_SECONDS:-30}"
+autostash_ref=""
+autostash_active=0
+autostash_restore_attempted=0
 
 usage() {
     printf '%s\n' \
@@ -34,6 +38,110 @@ log() {
 die() {
     printf '[hermes-local-update] ERROR: %s\n' "$*" >&2
     exit 1
+}
+
+preserve_local_changes() {
+    local previous_stash stash_rc current_stash
+
+    test -n "$(git status --porcelain --untracked-files=normal)" || return 0
+
+    previous_stash="$(git rev-parse --verify --quiet refs/stash || true)"
+    log "local changes detected; snapshotting them before the clean update window"
+
+    # Reuse Hermes's tested autostash implementation. It captures tracked and
+    # untracked work, verifies that a new stash object exists, and handles the
+    # permission-denied edge where Git saves a complete stash but cannot remove
+    # an untracked path from the checkout.
+    set +e
+    "$python_bin" - "$repo" <<'PY'
+import sys
+from pathlib import Path
+
+from hermes_cli import main as hermes_main
+
+stash_ref = hermes_main._stash_local_changes_if_needed(
+    ["git"], Path(sys.argv[1])
+)
+if not stash_ref:
+    raise SystemExit("dirty worktree produced no Hermes autostash")
+PY
+    stash_rc=$?
+    set -e
+
+    current_stash="$(git rev-parse --verify --quiet refs/stash || true)"
+    if test -n "$current_stash" && test "$current_stash" != "$previous_stash"; then
+        autostash_ref="$current_stash"
+        autostash_active=1
+    fi
+
+    test "$stash_rc" -eq 0 || die \
+        "could not snapshot local changes; the checkout was not updated"
+    test "$autostash_active" -eq 1 || die \
+        "Hermes reported a snapshot but no new stash could be verified"
+    test -z "$(git status --porcelain --untracked-files=normal)" || die \
+        "local changes are preserved in stash $autostash_ref, but the checkout could not be made clean"
+
+    log "local changes preserved in stash ${autostash_ref:0:12}"
+}
+
+restore_local_changes() {
+    local restore_rc
+
+    test "$autostash_active" -eq 1 || return 0
+    autostash_restore_attempted=1
+
+    if test "$(git branch --show-current)" != "$patch_branch"; then
+        return 1
+    fi
+    if test -n "$(git status --porcelain --untracked-files=normal)"; then
+        return 1
+    fi
+
+    log "restoring the preserved local changes"
+    set +e
+    "$python_bin" - "$repo" "$autostash_ref" <<'PY'
+import sys
+from pathlib import Path
+
+from hermes_cli import main as hermes_main
+
+restored = hermes_main._restore_stashed_changes(
+    ["git"], Path(sys.argv[1]), sys.argv[2], prompt_user=False
+)
+raise SystemExit(0 if restored else 1)
+PY
+    restore_rc=$?
+    set -e
+
+    if test "$restore_rc" -eq 0; then
+        autostash_active=0
+        log "local changes restored"
+        return 0
+    fi
+    return 1
+}
+
+restore_local_changes_on_exit() {
+    local exit_code=$?
+
+    trap - EXIT
+    if test "$autostash_active" -eq 1 && \
+            test "$autostash_restore_attempted" -eq 0; then
+        log "update stopped before local changes were restored; attempting recovery"
+        if ! restore_local_changes; then
+            printf '%s\n' \
+                "[hermes-local-update] ERROR: local changes remain safely preserved in stash $autostash_ref" \
+                '[hermes-local-update] Inspect git status before applying that stash manually.' >&2
+            if test "$exit_code" -eq 0; then
+                exit_code=1
+            fi
+        fi
+    elif test "$autostash_active" -eq 1; then
+        printf '%s\n' \
+            "[hermes-local-update] ERROR: local changes remain safely preserved in stash $autostash_ref" \
+            '[hermes-local-update] Inspect git status before applying that stash manually.' >&2
+    fi
+    exit "$exit_code"
 }
 
 case "${1:-}" in
@@ -62,7 +170,7 @@ test -d "$repo/.git" || die "not a Git checkout: $repo"
 cd "$repo"
 
 hermes_bin="${HERMES_BIN:-$repo/venv/bin/hermes}"
-python_bin="$repo/venv/bin/python"
+python_bin="${HERMES_PYTHON_BIN:-$repo/venv/bin/python}"
 test -x "$hermes_bin" || die "Hermes CLI is not executable: $hermes_bin"
 test -x "$python_bin" || die "Hermes Python is not executable: $python_bin"
 
@@ -119,10 +227,6 @@ current_branch="$(git branch --show-current)"
 test "$current_branch" = "$patch_branch" || die \
     "checkout must be on '$patch_branch' (currently '${current_branch:-detached HEAD}')"
 
-worktree_status="$(git status --porcelain --untracked-files=normal)"
-test -z "$worktree_status" || die \
-    "working tree is dirty; commit or stash it before updating"
-
 origin_url="$(git remote get-url origin 2>/dev/null || true)"
 case "$origin_url" in
     *NousResearch/hermes-agent|*NousResearch/hermes-agent.git) ;;
@@ -159,6 +263,9 @@ test "$backup_mode" = "quick" || die \
 
 before_sha="$(git rev-parse HEAD)"
 
+trap restore_local_changes_on_exit EXIT
+preserve_local_changes
+
 log "pushing the pre-update patch stack to $backup_remote/$backup_ref"
 git push "$backup_remote" "HEAD:$backup_ref"
 
@@ -173,7 +280,7 @@ git merge-base --is-ancestor "origin/$target_branch" HEAD || die \
     "updated branch does not contain origin/$target_branch"
 
 log "verifying Python, SQLite, and FTS5"
-"$repo/venv/bin/python" -c '
+"$python_bin" -c '
 import sqlite3
 import sys
 from hermes_cli.sqlite_runtime import probe_sqlite_runtime
@@ -198,7 +305,7 @@ if test -z "$uv_bin" && test -x "$HOME/.hermes/bin/uv"; then
     uv_bin="$HOME/.hermes/bin/uv"
 fi
 test -n "$uv_bin" || die "uv is unavailable for the dependency compatibility check"
-"$uv_bin" pip check --python "$repo/venv/bin/python"
+"$uv_bin" pip check --python "$python_bin"
 
 ensure_gateway_services
 
@@ -209,4 +316,7 @@ test "$remote_sha" = "$(git rev-parse HEAD)" || die \
     "$backup remote readback does not match local HEAD"
 
 after_sha="$(git rev-parse HEAD)"
+restore_local_changes || die \
+    "update completed, but local changes could not be reapplied automatically; they remain safe in stash $autostash_ref"
+trap - EXIT
 log "complete before=${before_sha:0:10} after=${after_sha:0:10} backup=$backup_remote/$backup_ref"
