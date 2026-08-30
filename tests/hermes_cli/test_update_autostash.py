@@ -263,6 +263,17 @@ def _setup_keep_stash_test(monkeypatch, tmp_path):
     monkeypatch.setattr(
         "hermes_cli.gateway.find_gateway_pids", lambda **kw: [], raising=False
     )
+    # The update path purges cached Hermes modules after the simulated pull.
+    # Without suppressing that purge here, the next gateway import discards the
+    # monkeypatch above and discovers/signals the developer machine's live
+    # services. The behavior under test is stash disposition, not fleet restart.
+    monkeypatch.setattr(
+        hermes_main, "_purge_stale_hermes_modules", lambda: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_inventory.collect_runtime_inventory",
+        lambda: SimpleNamespace(runtimes=[], to_dict=lambda: {}),
+    )
     return restore_calls, discard_calls, park_calls
 
 
