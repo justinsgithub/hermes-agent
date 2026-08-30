@@ -1,19 +1,27 @@
 # Current State
 
 <!-- REPO-STATUS:START -->
-_Last updated: 2026-08-29T09:09:55-07:00_
+_Last updated: 2026-08-29T23:48:09-07:00_
 
 - Repo path: `/home/justin/.hermes/hermes-agent`
 - Branch: `justin/main`
-- Snapshot base commit: `03eb14087c fix(api): preserve tool history across durable runs`
+- Snapshot base commit: `32322c3a5e merge: reconcile upstream main`
 - Remote: `git@github.com:NousResearch/hermes-agent.git`
-- Working tree: `clean`
+- Working tree: `dirty`
+- Status:
+  - ` M gateway/platforms/api_server.py`
+  - ` M scripts/hermes-local-update.sh`
+  - ` M tests/gateway/test_api_server.py`
+  - ` M tests/gateway/test_api_server_runs.py`
+  - ` M tests/hermes_cli/test_approval_transport.py`
+  - ` M tests/scripts/test_hermes_local_update.py`
+  - ` M tools/approval.py`
 - Recent commits:
-  - `03eb14087c fix(api): preserve tool history across durable runs`
-  - `a63343afc5 docs: refresh Hermes durable-run state`
-  - `cae3776264 fix(api): honor memory bypass on durable runs`
-  - `440c81d887 fix(browser): preserve Linux real-profile logins`
-  - `540425c2d9 docs: record Hermes auto-prune enablement`
+  - `32322c3a5e merge: reconcile upstream main`
+  - `554e4406b2 fix(update): preserve dirty local work`
+  - `26350357d7 test: add InlineQueryHandler to every fake telegram.ext module tree`
+  - `31dbc2493f test: cover InlineQueryHandler in lazy-install rebind and handler-count contracts`
+  - `5bdaea64ed feat(telegram): inline command picker — search every command and skill, no menu cap`
 - Key scripts:
   - `apps/bootstrap-installer` `build`: `tsc -b && vite build`
   - `apps/bootstrap-installer` `check`: `npm run typecheck && npm run lint`
@@ -68,6 +76,25 @@ both.
 
 ## Recent Changes
 
+- Made `hermes-local-update` safe on a dirty `justin/main`. Read-only
+  `--check`/`--plan` leave local work untouched; a real update snapshots tracked
+  and untracked changes outside the clean update window, restores them after
+  runtime/service/fork verification, restores them on an early failure, and
+  retains the exact recovery stash if reapplication conflicts. The final service
+  gate now includes the externally supervised `jarvis-hermes-api.service` in
+  addition to the default and Tyler gateways.
+- Merged official `origin/main` at `26350357d7` into the maintained patch stack
+  as `32322c3a5e`. The three real-profile conflicts were reconciled by retaining
+  the live-verified Linux libsecret/PID-bound launch while accepting upstream's
+  non-Linux direct launch, profile pin, headless, and process-reaping work. The
+  auth-DB copier now combines upstream's immutable read with the local hard
+  ten-second `Connection.backup()` deadline.
+- The dogfood update ran with the five existing API/approval files still dirty,
+  rebuilt the web UI, verified 205 installed packages, restarted the managed
+  fleet, pushed and read back `fork/main`, and restored the exact predicted WIP
+  tree. A Jarvis profile-validator mismatch exposed by config migration was
+  repaired in the owning Jarvis repository; all three managed services now run
+  the updated checkout.
 - Fixed durable `/v1/runs` session continuity. A caller-provided `session_id`
   now loads the existing SessionDB transcript when explicit request history is
   absent, including prior tool calls and tool results, and reopens that session
@@ -104,13 +131,13 @@ both.
   DBSTAT, CARRAY, and JSON support. The previous venv is parked beside `venv`
   as `venv.stale.runtime-1787926352-2873696-b367df54` for rollback.
 - Added `scripts/hermes-local-update.sh` and the
-  `~/.local/bin/hermes-local-update` launcher. The wrapper requires a clean
-  `justin/main`, validates the official origin and `update_in_place`/quick-
-  backup config, pre-pushes the patch stack, delegates backup/config/dependency/
+  `~/.local/bin/hermes-local-update` launcher. The wrapper validates the official
+  origin and `update_in_place`/quick-backup config, automatically preserves a
+  dirty worktree, pre-pushes the patch stack, delegates backup/config/dependency/
   UI/restart work to Hermes's built-in updater, then verifies upstream ancestry,
-  the safe SQLite+FTS5 runtime, package compatibility, both live service PIDs,
-  and the final fork readback. Local `main` now tracks `origin/main` without
-  patches, so the built-in updater can never mistake the patch stack for an
+  the safe SQLite+FTS5 runtime, package compatibility, all three managed service
+  PIDs, and the final fork readback. Local `main` tracks `origin/main` without
+  patches, so the built-in updater cannot mistake the patch stack for an
   upstream force-push on a same-named branch.
 - The first real wrapper run merged 187 upstream commits into `justin/main`,
   refreshed Python/lazy dependencies and Node workspaces, rebuilt the web UI,
@@ -166,6 +193,16 @@ both.
 
 ## Verification
 
+- Dirty-tree updater regression: five disposable-Git E2E cases pass, covering
+  dirty `--check`/`--plan`, successful tracked/staged/untracked preservation,
+  early updater failure recovery, and conflict retention with exact stash
+  readback. The merged tree also passes 120 focused real-profile tests and nine
+  built-in autostash tests. The real installed update exited zero with WIP tree
+  `7d56dca5400a2550c3a3b2a4460f3599ccfe21e6` restored exactly; `fork/main`
+  equals `32322c3a5e`; divergence is 26 ahead, zero behind; Python 3.11.16,
+  SQLite 3.53.4, FTS5, and 205-package compatibility passed. Final
+  `--repair-services` verified default PID 3139130, Jarvis PID 3190089, and
+  Tyler PID 3139100 on the hardened interpreter.
 - `/v1/runs` continuity regression: the full endpoint suite passed 28/28 and
   Ruff/diff checks passed. A live two-turn, memory-bypassed canary used the UTC
   time tool in turn one, returned only `READY`, then recovered the exact prior
@@ -284,12 +321,16 @@ hermes-local-update --repair-services  # recover/verify gateways; no source upda
 hermes-local-update          # back up, merge, install, restart, verify, push
 ```
 
-The update command fails closed if the branch is not `justin/main`, the worktree
-is dirty, the origin/backup remotes are wrong, the required update config has
-drifted, the merge conflicts, SQLite becomes vulnerable or loses FTS5, package
-compatibility fails, either gateway is inactive/stale, or the fork readback does
-not match local HEAD. It never uses `git reset --hard` or an unconditional force
-push.
+`--check` and `--plan` are read-only even when the worktree is dirty. A full
+update automatically stashes tracked and untracked local work, keeps the update
+and service-verification window clean, then reapplies and drops that exact stash.
+An early failure triggers automatic restoration; a true restore conflict leaves
+the checkout clean and retains the named stash for recovery. The command still
+fails closed if the branch is not `justin/main`, the origin/backup remotes or
+required config drift, the upstream merge conflicts, SQLite becomes vulnerable
+or loses FTS5, package compatibility fails, any default/Jarvis/Tyler managed
+gateway is inactive or stale, or the fork readback differs from local HEAD. It
+never uses an unconditional force push.
 
 ## Next Work
 

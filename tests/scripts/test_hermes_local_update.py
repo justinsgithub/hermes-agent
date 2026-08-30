@@ -188,6 +188,7 @@ def test_update_snapshots_then_restores_dirty_tree(updater_repo):
     assert result.returncode == 0, result.stdout + result.stderr
     assert "local changes preserved in stash" in result.stdout
     assert "local changes restored" in result.stdout
+    assert "jarvis-hermes-api.service active" in result.stdout
     assert "working tree is dirty" not in result.stderr
     assert (repo / "tracked.txt").read_text() == "local edit\n"
     assert (repo / "local-patch.txt").read_text() == "staged local edit\n"

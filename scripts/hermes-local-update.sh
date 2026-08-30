@@ -28,7 +28,7 @@ usage() {
         '  no argument  Back up, update, verify, restart, and push.' \
         '  --check      Fetch and report upstream divergence only.' \
         '  --plan       Show divergence and Hermes restart plan only.' \
-        '  --repair-services  Recover and verify the two local gateways only.'
+        '  --repair-services  Recover and verify the managed local gateways only.'
 }
 
 log() {
@@ -197,7 +197,10 @@ wait_for_service_runtime() {
 
 ensure_gateway_services() {
     local service
-    for service in hermes-gateway.service hermes-gateway-tyler.service; do
+    for service in \
+            hermes-gateway.service \
+            jarvis-hermes-api.service \
+            hermes-gateway-tyler.service; do
         # systemd Restart=always intentionally creates a brief inactive gap.
         # Let that bounded self-recovery settle before taking over.
         if ! wait_for_service_runtime "$service" "$service_settle_seconds"; then
